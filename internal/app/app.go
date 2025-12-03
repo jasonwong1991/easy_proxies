@@ -27,6 +27,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		Enabled:       cfg.ManagementEnabled(),
 		Listen:        cfg.Management.Listen,
 		ProbeTarget:   cfg.Management.ProbeTarget,
+		ProbeTimeout:  cfg.SubscriptionRefresh.Timeout, // 使用订阅刷新的超时配置
 		Password:      cfg.Management.Password,
 		ProxyUsername: proxyUsername,
 		ProxyPassword: proxyPassword,

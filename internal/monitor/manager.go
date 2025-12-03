@@ -19,6 +19,7 @@ type Config struct {
 	Enabled       bool
 	Listen        string
 	ProbeTarget   string
+	ProbeTimeout  time.Duration // 探测超时时间，默认 30s
 	Password      string
 	ProxyUsername string // 代理池的用户名（用于导出）
 	ProxyPassword string // 代理池的密码（用于导出）
@@ -247,6 +248,15 @@ func (m *Manager) DestinationForProbe() (M.Socksaddr, bool) {
 		return M.Socksaddr{}, false
 	}
 	return m.probeDst, true
+}
+
+// ProbeTimeout returns the configured probe timeout duration.
+// Returns 30s as default if not configured.
+func (m *Manager) ProbeTimeout() time.Duration {
+	if m.cfg.ProbeTimeout > 0 {
+		return m.cfg.ProbeTimeout
+	}
+	return 30 * time.Second
 }
 
 // Snapshot returns a sorted copy of current node states.

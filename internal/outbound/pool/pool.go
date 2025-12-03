@@ -243,9 +243,15 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 	availableCount := 0
 	failedCount := 0
 
+	// Get probe timeout from monitor config
+	probeTimeout := 30 * time.Second
+	if p.monitor != nil {
+		probeTimeout = p.monitor.ProbeTimeout()
+	}
+
 	for _, member := range members {
 		// Create a timeout context for each probe
-		ctx, cancel := context.WithTimeout(p.ctx, 15*time.Second)
+		ctx, cancel := context.WithTimeout(p.ctx, probeTimeout)
 
 		start := time.Now()
 		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
