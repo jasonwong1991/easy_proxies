@@ -135,6 +135,14 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.currentBox = instance
 	m.mu.Unlock()
 
+	// Start periodic health check after nodes are registered
+	m.mu.Lock()
+	if m.monitorMgr != nil && !m.healthCheckStarted {
+		m.monitorMgr.StartPeriodicHealthCheck(periodicHealthInterval, periodicHealthTimeout)
+		m.healthCheckStarted = true
+	}
+	m.mu.Unlock()
+
 	// Wait for initial health check if min nodes configured
 	if cfg.SubscriptionRefresh.MinAvailableNodes > 0 {
 		timeout := cfg.SubscriptionRefresh.HealthCheckTimeout
@@ -420,10 +428,7 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 		if m.monitorServer != nil {
 			m.monitorServer.SetNodeManager(m)
 		}
-		if !m.healthCheckStarted {
-			monitorMgr.StartPeriodicHealthCheck(periodicHealthInterval, periodicHealthTimeout)
-			m.healthCheckStarted = true
-		}
+		// Note: StartPeriodicHealthCheck is called after nodes are registered in Start()
 	}
 	m.mu.Unlock()
 
