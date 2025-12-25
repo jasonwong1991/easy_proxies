@@ -430,7 +430,7 @@
       align-items: center;
       gap: 12px;
       max-width: 420px;
-      z-index: 1000;
+      z-index: 3000;
       animation: slideIn 0.4s cubic-bezier(0.4, 0, 0.2, 1);
     }
 
@@ -1318,21 +1318,35 @@
         return;
       }
 
-      // 复制到剪贴板
-      navigator.clipboard.writeText(url).then(() => {
-        const formatName = format === 'surge' ? 'Surge' : 'HTTP';
-        showToast(`${formatName} 订阅地址已复制到剪贴板`, 'success');
-      }).catch(err => {
-        // 降级方案：使用传统方法
-        input.select();
-        try {
-          document.execCommand('copy');
-          const formatName = format === 'surge' ? 'Surge' : 'HTTP';
+      const formatName = format === 'surge' ? 'Surge' : 'HTTP';
+
+      // 尝试使用现代 API
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(() => {
           showToast(`${formatName} 订阅地址已复制到剪贴板`, 'success');
-        } catch (e) {
-          showToast('复制失败，请手动复制', 'error');
-        }
-      });
+        }).catch(() => {
+          fallbackCopy(url, formatName);
+        });
+      } else {
+        fallbackCopy(url, formatName);
+      }
+    }
+
+    // 降级复制方案
+    function fallbackCopy(text, formatName) {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const success = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      if (success) {
+        showToast(`${formatName} 订阅地址已复制到剪贴板`, 'success');
+      } else {
+        showToast('复制失败，请手动复制', 'error');
+      }
     }
 
     // 隐藏导出格式选择弹窗
