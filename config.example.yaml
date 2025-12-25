@@ -22,6 +22,8 @@ multi_port:
   base_port: 24000
   username: mpuser
   password: mppass
+  inbound_type: http  # "http"（默认）或 "ss"（Shadowsocks）
+  ss_method: aes-128-gcm  # Shadowsocks 加密方式（仅 inbound_type: ss 时生效）
 
 # ═══════════════════════════════════════════════════════════════
 # 节点配置方式（三选一或混合使用）
