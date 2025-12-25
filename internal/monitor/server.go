@@ -536,18 +536,17 @@ func (s *Server) formatSurge(snap Snapshot, listenAddr string) string {
 		nodeName, listenAddr, snap.Port)
 }
 
-// sanitizeNodeName 清理节点名称，移除 Surge 不支持的字符
+// sanitizeNodeName 处理节点名称，保留原始名称（包括特殊符号和emoji）
+// 如果名称包含特殊字符，用引号包裹以兼容 Surge 格式
 func sanitizeNodeName(name string) string {
-	// 替换特殊字符为下划线
-	replacer := strings.NewReplacer(
-		"=", "_",
-		",", "_",
-		"[", "_",
-		"]", "_",
-		"\"", "_",
-		"'", "_",
-	)
-	return replacer.Replace(name)
+	// 检查是否包含需要引号包裹的字符
+	needsQuote := strings.ContainsAny(name, "=,[]\"'")
+	if needsQuote {
+		// 转义内部双引号，用双引号包裹
+		escaped := strings.ReplaceAll(name, "\"", "\\\"")
+		return "\"" + escaped + "\""
+	}
+	return name
 }
 
 // handleSettings handles GET/PUT for dynamic settings (external_ip, probe_target, skip_cert_verify).
