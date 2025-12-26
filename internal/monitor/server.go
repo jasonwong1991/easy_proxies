@@ -407,6 +407,21 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
+		// 检查 URL 参数中的 API Key
+		if apiKey := r.URL.Query().Get("key"); apiKey != "" {
+			s.cfgMu.RLock()
+			configuredKey := ""
+			if s.cfgSrc != nil {
+				configuredKey = s.cfgSrc.Management.APIKey
+			}
+			s.cfgMu.RUnlock()
+
+			if configuredKey != "" && apiKey == configuredKey {
+				next(w, r)
+				return
+			}
+		}
+
 		// 检查 Cookie 中的 session token
 		cookie, err := r.Cookie("session_token")
 		if err == nil && cookie.Value == s.sessionToken {
@@ -476,12 +491,18 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleExport 导出所有可用代理池节点的 HTTP 代理 URI，每行一个
+// handleExport 导出所有可用代理池节点
+// 支持 format 参数: http (默认), surge
 // 在 hybrid 模式下，只导出 multi-port 格式（每节点独立端口）
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
+	}
+
+	format := strings.ToLower(r.URL.Query().Get("format"))
+	if format == "" {
+		format = "http"
 	}
 
 	// 只导出初始检查通过的可用节点
@@ -503,21 +524,69 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		var proxyURI string
-		if s.cfg.ProxyUsername != "" && s.cfg.ProxyPassword != "" {
-			proxyURI = fmt.Sprintf("http://%s:%s@%s:%d",
-				s.cfg.ProxyUsername, s.cfg.ProxyPassword,
-				listenAddr, snap.Port)
-		} else {
-			proxyURI = fmt.Sprintf("http://%s:%d", listenAddr, snap.Port)
+		var line string
+		switch format {
+		case "surge":
+			line = s.formatSurge(snap, listenAddr)
+		default:
+			// HTTP format
+			if s.cfg.ProxyUsername != "" && s.cfg.ProxyPassword != "" {
+				line = fmt.Sprintf("http://%s:%s@%s:%d",
+					s.cfg.ProxyUsername, s.cfg.ProxyPassword,
+					listenAddr, snap.Port)
+			} else {
+				line = fmt.Sprintf("http://%s:%d", listenAddr, snap.Port)
+			}
 		}
-		lines = append(lines, proxyURI)
+		if line != "" {
+			lines = append(lines, line)
+		}
 	}
 
 	// 返回纯文本，每行一个 URI
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Content-Disposition", "attachment; filename=proxy_pool.txt")
+	filename := "proxy_pool.txt"
+	if format == "surge" {
+		filename = "surge_proxies.conf"
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
 	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
+}
+
+// formatSurge 生成 Surge 格式的代理配置行
+func (s *Server) formatSurge(snap Snapshot, listenAddr string) string {
+	// 根据 inbound 类型生成不同格式
+	inboundType := strings.ToLower(s.cfg.InboundType)
+	nodeName := sanitizeNodeName(snap.Name)
+
+	if inboundType == "ss" {
+		// Surge Shadowsocks 格式:
+		// ProxyName = ss, server, port, encrypt-method=xxx, password=xxx
+		return fmt.Sprintf("%s = ss, %s, %d, encrypt-method=%s, password=%s",
+			nodeName, listenAddr, snap.Port, s.cfg.SSMethod, s.cfg.ProxyPassword)
+	}
+
+	// HTTP 代理格式:
+	// ProxyName = http, server, port, username, password
+	if s.cfg.ProxyUsername != "" && s.cfg.ProxyPassword != "" {
+		return fmt.Sprintf("%s = http, %s, %d, %s, %s",
+			nodeName, listenAddr, snap.Port, s.cfg.ProxyUsername, s.cfg.ProxyPassword)
+	}
+	return fmt.Sprintf("%s = http, %s, %d",
+		nodeName, listenAddr, snap.Port)
+}
+
+// sanitizeNodeName 处理节点名称，保留原始名称（包括特殊符号和emoji）
+// 如果名称包含特殊字符，用引号包裹以兼容 Surge 格式
+func sanitizeNodeName(name string) string {
+	// 检查是否包含需要引号包裹的字符
+	needsQuote := strings.ContainsAny(name, "=,[]\"'")
+	if needsQuote {
+		// 转义内部双引号，用双引号包裹
+		escaped := strings.ReplaceAll(name, "\"", "\\\"")
+		return "\"" + escaped + "\""
+	}
+	return name
 }
 
 // handleSettings handles GET/PUT for dynamic settings (external_ip, probe_target, skip_cert_verify).
@@ -525,10 +594,22 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		extIP, probeTarget, skipCertVerify := s.getSettings()
+
+		// 获取 API Key 和监听地址用于订阅 URL
+		s.cfgMu.RLock()
+		apiKey := ""
+		listenAddr := s.cfg.Listen
+		if s.cfgSrc != nil {
+			apiKey = s.cfgSrc.Management.APIKey
+		}
+		s.cfgMu.RUnlock()
+
 		writeJSON(w, map[string]any{
 			"external_ip":      extIP,
 			"probe_target":     probeTarget,
 			"skip_cert_verify": skipCertVerify,
+			"api_key":          apiKey,
+			"listen_address":   listenAddr,
 		})
 	case http.MethodPut:
 		var req struct {

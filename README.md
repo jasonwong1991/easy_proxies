@@ -75,6 +75,7 @@ management:
   listen: 0.0.0.0:9090        # Web dashboard address
   probe_target: www.apple.com:80  # Latency probe target
   password: ""                # WebUI password (optional)
+  api_key: ""                 # Subscription API key for URL auth (optional)
 
 # Unified Entry Listener
 listener:
@@ -334,6 +335,7 @@ Access `http://localhost:9090` to view:
 - Manual latency probing
 - Release blacklisted nodes
 - **One-click Export**: Export all available nodes as proxy URIs (`http://user:pass@host:port`)
+- **Subscription URL**: API Key authentication for direct subscription in Surge/Clash clients
 - **Settings**: Click the gear icon to modify `external_ip` and `probe_target` (changes saved immediately)
 
 ### WebUI Settings
@@ -368,6 +370,7 @@ In Multi-Port mode, ports are automatically allocated from `base_port`.
 | PUT | `/api/nodes/config/:name` | Update node by name |
 | DELETE | `/api/nodes/config/:name` | Delete node by name |
 | POST | `/api/reload` | Reload configuration |
+| GET | `/api/export` | Export available nodes (`?format=surge&key=xxx`) |
 | GET | `/api/settings` | Get current settings |
 | PUT | `/api/settings` | Update settings (external_ip, probe_target) |
 
@@ -385,6 +388,25 @@ curl -X DELETE http://localhost:9090/api/nodes/config/NodeName
 # Reload config
 curl -X POST http://localhost:9090/api/reload
 ```
+
+### Subscription URL
+
+Configure `api_key` to enable URL parameter authentication for direct subscription:
+
+```yaml
+management:
+  password: "admin123"
+  api_key: "your-secret-key"  # Subscription auth key
+```
+
+**Subscription URL Format:**
+
+| Format | URL |
+|--------|-----|
+| HTTP | `http://host:9090/api/export?key=your-secret-key` |
+| Surge | `http://host:9090/api/export?format=surge&key=your-secret-key` |
+
+Copy subscription URLs directly from the WebUI export dialog.
 
 ### Health Check Mechanism
 

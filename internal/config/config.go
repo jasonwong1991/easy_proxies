@@ -52,10 +52,12 @@ type PoolConfig struct {
 
 // MultiPortConfig defines address/credential defaults for multi-port mode.
 type MultiPortConfig struct {
-	Address  string `yaml:"address"`
-	BasePort uint16 `yaml:"base_port"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
+	Address     string `yaml:"address"`
+	BasePort    uint16 `yaml:"base_port"`
+	Username    string `yaml:"username"`
+	Password    string `yaml:"password"`
+	InboundType string `yaml:"inbound_type"` // "http" (default) or "ss" (shadowsocks)
+	SSMethod    string `yaml:"ss_method"`    // Shadowsocks encryption method, default "aes-128-gcm"
 }
 
 // ManagementConfig controls the monitoring HTTP endpoint.
@@ -64,6 +66,7 @@ type ManagementConfig struct {
 	Listen      string `yaml:"listen"`
 	ProbeTarget string `yaml:"probe_target"`
 	Password    string `yaml:"password"` // WebUI 访问密码，为空则不需要密码
+	APIKey      string `yaml:"api_key"`  // API 订阅密钥，用于 URL 参数认证
 }
 
 // SubscriptionRefreshConfig controls subscription auto-refresh and reload settings.
@@ -158,6 +161,12 @@ func (c *Config) normalize() error {
 	}
 	if c.MultiPort.BasePort == 0 {
 		c.MultiPort.BasePort = 28000
+	}
+	if c.MultiPort.InboundType == "" {
+		c.MultiPort.InboundType = "http"
+	}
+	if c.MultiPort.SSMethod == "" {
+		c.MultiPort.SSMethod = "aes-128-gcm"
 	}
 	if c.Management.Listen == "" {
 		c.Management.Listen = "127.0.0.1:9090"
@@ -368,6 +377,12 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	}
 	if c.MultiPort.BasePort == 0 {
 		c.MultiPort.BasePort = 28000
+	}
+	if c.MultiPort.InboundType == "" {
+		c.MultiPort.InboundType = "http"
+	}
+	if c.MultiPort.SSMethod == "" {
+		c.MultiPort.SSMethod = "aes-128-gcm"
 	}
 	if c.Management.Listen == "" {
 		c.Management.Listen = "127.0.0.1:9090"

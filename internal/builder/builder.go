@@ -141,23 +141,47 @@ func Build(cfg *config.Config) (option.Options, error) {
 				Options: &perOptions,
 			}
 			outbounds = append(outbounds, perPool)
-			inboundOptions := &option.HTTPMixedInboundOptions{
-				ListenOptions: option.ListenOptions{
-					Listen:     addr,
-					ListenPort: meta.Port,
-				},
-			}
-			username := cfg.MultiPort.Username
-			password := cfg.MultiPort.Password
-			if username != "" {
-				inboundOptions.Users = []auth.User{{Username: username, Password: password}}
-			}
+
 			inboundTag := fmt.Sprintf("in-%s", tag)
-			inbounds = append(inbounds, option.Inbound{
-				Type:    C.TypeHTTP,
-				Tag:     inboundTag,
-				Options: inboundOptions,
-			})
+			var inbound option.Inbound
+
+			// Choose inbound type based on configuration
+			if strings.ToLower(cfg.MultiPort.InboundType) == "ss" {
+				// Shadowsocks inbound
+				ssOptions := &option.ShadowsocksInboundOptions{
+					ListenOptions: option.ListenOptions{
+						Listen:     addr,
+						ListenPort: meta.Port,
+					},
+					Method:   cfg.MultiPort.SSMethod,
+					Password: cfg.MultiPort.Password,
+				}
+				inbound = option.Inbound{
+					Type:    C.TypeShadowsocks,
+					Tag:     inboundTag,
+					Options: ssOptions,
+				}
+			} else {
+				// HTTP inbound (default)
+				httpOptions := &option.HTTPMixedInboundOptions{
+					ListenOptions: option.ListenOptions{
+						Listen:     addr,
+						ListenPort: meta.Port,
+					},
+				}
+				username := cfg.MultiPort.Username
+				password := cfg.MultiPort.Password
+				if username != "" {
+					httpOptions.Users = []auth.User{{Username: username, Password: password}}
+				}
+				inbound = option.Inbound{
+					Type:    C.TypeHTTP,
+					Tag:     inboundTag,
+					Options: httpOptions,
+				}
+			}
+
+			inbounds = append(inbounds, inbound)
 			route.Rules = append(route.Rules, option.Rule{
 				Type: C.RuleTypeDefault,
 				DefaultOptions: option.DefaultRule{

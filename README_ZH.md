@@ -75,6 +75,7 @@ management:
   listen: 0.0.0.0:9090        # Web 监控面板地址
   probe_target: www.apple.com:80  # 延迟探测目标
   password: ""                # WebUI 访问密码，为空则不需要密码（可选）
+  api_key: ""                 # 订阅 API Key，用于 URL 参数认证（可选）
 
 # 统一入口监听
 listener:
@@ -335,6 +336,7 @@ hysteria2://password@server:port?sni=example.com&insecure=0&obfs=salamander&obfs
 - 手动探测延迟
 - 解除节点拉黑
 - **一键导出节点**: 导出所有可用节点的代理池 URI（格式：`http://user:pass@host:port`）
+- **订阅地址**: 支持 API Key 认证，可直接用于 Surge/Clash 等客户端订阅
 - **设置**: 点击齿轮图标修改 `external_ip` 和 `probe_target`（立即保存生效）
 
 ### WebUI 设置
@@ -369,6 +371,7 @@ Multi-Port 模式下，端口从 `base_port` 自动分配。
 | PUT | `/api/nodes/config/:name` | 按名称更新节点 |
 | DELETE | `/api/nodes/config/:name` | 按名称删除节点 |
 | POST | `/api/reload` | 重载配置 |
+| GET | `/api/export` | 导出可用节点（支持 `?format=surge&key=xxx`） |
 | GET | `/api/settings` | 获取当前设置 |
 | PUT | `/api/settings` | 更新设置（external_ip, probe_target） |
 
@@ -386,6 +389,25 @@ curl -X DELETE http://localhost:9090/api/nodes/config/节点名称
 # 重载配置
 curl -X POST http://localhost:9090/api/reload
 ```
+
+### 订阅地址
+
+配置 `api_key` 后，可通过 URL 参数认证直接订阅，无需登录：
+
+```yaml
+management:
+  password: "admin123"
+  api_key: "your-secret-key"  # 订阅认证密钥
+```
+
+**订阅 URL 格式：**
+
+| 格式 | URL |
+|------|-----|
+| HTTP | `http://host:9090/api/export?key=your-secret-key` |
+| Surge | `http://host:9090/api/export?format=surge&key=your-secret-key` |
+
+在 WebUI 导出弹窗中可直接复制订阅地址。
 
 ### 健康检查机制
 

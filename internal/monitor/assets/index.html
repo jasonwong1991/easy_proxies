@@ -430,7 +430,7 @@
       align-items: center;
       gap: 12px;
       max-width: 420px;
-      z-index: 1000;
+      z-index: 3000;
       animation: slideIn 0.4s cubic-bezier(0.4, 0, 0.2, 1);
     }
 
@@ -926,7 +926,7 @@
       <button class="btn btn-secondary" onclick="toggleAutoRefresh()">
         <span id="autoRefreshText">关闭自动刷新</span>
       </button>
-      <button class="btn btn-secondary" onclick="exportNodes()">
+      <button class="btn btn-secondary" onclick="showExportModal()">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
           <path d="M8 0L8 10M8 10L5 7M8 10L11 7M2 13h12v3H2z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
@@ -1165,6 +1165,80 @@
     </div>
   </div>
 
+  <!-- 导出格式选择弹窗 -->
+  <div id="exportOverlay" class="login-overlay">
+    <div class="login-modal" style="max-width: 500px;">
+      <div class="login-header">
+        <h2>📤 导出节点</h2>
+        <p>选择导出格式或使用订阅地址</p>
+      </div>
+      <div class="login-form">
+        <!-- 订阅地址区域 -->
+        <div id="subscriptionUrlSection" style="margin-bottom: 24px; padding: 16px; background: rgba(99, 102, 241, 0.1); border-radius: 8px; border: 1px solid rgba(99, 102, 241, 0.2);">
+          <div style="display: flex; align-items: center; margin-bottom: 12px;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" style="margin-right: 8px;">
+              <path d="M13 2L3 14h8l-1 8 10-12h-8l1-8z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <strong style="color: var(--primary); font-size: 14px;">订阅地址</strong>
+          </div>
+
+          <div style="margin-bottom: 12px;">
+            <label class="form-label" style="font-size: 12px; margin-bottom: 6px;">HTTP 格式订阅</label>
+            <div style="display: flex; gap: 8px;">
+              <input type="text" id="httpSubscriptionUrl" readonly class="form-input" style="flex: 1; font-size: 12px; font-family: monospace; background: rgba(255,255,255,0.05);" placeholder="加载中...">
+              <button class="btn btn-secondary" style="padding: 8px 16px; white-space: nowrap;" onclick="copySubscriptionUrl('http')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                  <rect x="9" y="9" width="13" height="13" rx="2" stroke="currentColor" stroke-width="2"/>
+                  <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" stroke="currentColor" stroke-width="2"/>
+                </svg>
+                复制
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <label class="form-label" style="font-size: 12px; margin-bottom: 6px;">Surge 格式订阅</label>
+            <div style="display: flex; gap: 8px;">
+              <input type="text" id="surgeSubscriptionUrl" readonly class="form-input" style="flex: 1; font-size: 12px; font-family: monospace; background: rgba(255,255,255,0.05);" placeholder="加载中...">
+              <button class="btn btn-secondary" style="padding: 8px 16px; white-space: nowrap;" onclick="copySubscriptionUrl('surge')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                  <rect x="9" y="9" width="13" height="13" rx="2" stroke="currentColor" stroke-width="2"/>
+                  <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" stroke="currentColor" stroke-width="2"/>
+                </svg>
+                复制
+              </button>
+            </div>
+          </div>
+
+          <p class="form-help" style="margin-top: 12px; font-size: 11px; text-align: center;">
+            将订阅地址添加到客户端，可自动更新节点列表
+          </p>
+        </div>
+
+        <!-- 下载导出区域 -->
+        <div style="padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.1);">
+          <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 12px; text-align: center;">或下载配置文件</p>
+          <div class="export-options">
+            <button class="btn btn-primary" style="width: 100%; margin-bottom: 12px;" onclick="exportNodes('http')">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <path d="M8 0L8 10M8 10L5 7M8 10L11 7M2 13h12v3H2z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              下载 HTTP 格式
+            </button>
+            <button class="btn btn-primary" style="width: 100%; margin-bottom: 12px; background: linear-gradient(135deg, #ff9500, #ff6b00);" onclick="exportNodes('surge')">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <path d="M8 0L8 10M8 10L5 7M8 10L11 7M2 13h12v3H2z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              下载 Surge 格式
+            </button>
+          </div>
+        </div>
+
+        <button type="button" class="btn btn-secondary" style="width: 100%; margin-top: 12px;" onclick="hideExportModal()">关闭</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     let autoRefreshInterval = null;
     let isAutoRefresh = true;
@@ -1218,10 +1292,109 @@
       }
     }
 
-    // 导出节点
-    async function exportNodes() {
+    // 显示导出格式选择弹窗
+    function showExportModal() {
+      document.getElementById('exportOverlay').classList.add('show');
+      // 加载订阅 URL
+      loadSubscriptionUrls();
+    }
+
+    // 加载订阅 URL
+    async function loadSubscriptionUrls() {
       try {
-        const res = await fetch('/api/export');
+        const res = await fetch('/api/settings');
+        if (!res.ok) {
+          throw new Error('获取设置失败');
+        }
+        const data = await res.json();
+
+        // 获取当前页面的 host
+        const currentHost = window.location.host;
+        const protocol = window.location.protocol;
+
+        // 构建订阅 URL
+        const apiKey = data.api_key || '';
+        const keyParam = apiKey ? `?key=${encodeURIComponent(apiKey)}` : '';
+
+        const httpUrl = `${protocol}//${currentHost}/api/export${keyParam}`;
+        const surgeUrl = `${protocol}//${currentHost}/api/export?format=surge${apiKey ? '&key=' + encodeURIComponent(apiKey) : ''}`;
+
+        // 更新输入框
+        document.getElementById('httpSubscriptionUrl').value = httpUrl;
+        document.getElementById('surgeSubscriptionUrl').value = surgeUrl;
+
+        // 如果没有配置 API Key，显示提示
+        if (!apiKey) {
+          const section = document.getElementById('subscriptionUrlSection');
+          const existingWarning = section.querySelector('.api-key-warning');
+          if (!existingWarning) {
+            const warning = document.createElement('div');
+            warning.className = 'api-key-warning';
+            warning.style.cssText = 'margin-top: 12px; padding: 8px 12px; background: rgba(255, 193, 7, 0.1); border: 1px solid rgba(255, 193, 7, 0.3); border-radius: 6px; font-size: 11px; color: #ffc107;';
+            warning.innerHTML = '⚠️ 未配置 API Key，订阅地址无认证保护。建议在配置文件中设置 <code style="background: rgba(0,0,0,0.2); padding: 2px 6px; border-radius: 3px;">management.api_key</code>';
+            section.appendChild(warning);
+          }
+        }
+      } catch (err) {
+        console.error('加载订阅 URL 失败:', err);
+        document.getElementById('httpSubscriptionUrl').value = '加载失败';
+        document.getElementById('surgeSubscriptionUrl').value = '加载失败';
+      }
+    }
+
+    // 复制订阅 URL
+    function copySubscriptionUrl(format) {
+      const inputId = format === 'surge' ? 'surgeSubscriptionUrl' : 'httpSubscriptionUrl';
+      const input = document.getElementById(inputId);
+      const url = input.value;
+
+      if (!url || url === '加载中...' || url === '加载失败') {
+        showToast('订阅地址未就绪', 'error');
+        return;
+      }
+
+      const formatName = format === 'surge' ? 'Surge' : 'HTTP';
+
+      // 尝试使用现代 API
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(() => {
+          showToast(`${formatName} 订阅地址已复制到剪贴板`, 'success');
+        }).catch(() => {
+          fallbackCopy(url, formatName);
+        });
+      } else {
+        fallbackCopy(url, formatName);
+      }
+    }
+
+    // 降级复制方案
+    function fallbackCopy(text, formatName) {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const success = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      if (success) {
+        showToast(`${formatName} 订阅地址已复制到剪贴板`, 'success');
+      } else {
+        showToast('复制失败，请手动复制', 'error');
+      }
+    }
+
+    // 隐藏导出格式选择弹窗
+    function hideExportModal() {
+      document.getElementById('exportOverlay').classList.remove('show');
+    }
+
+    // 导出节点
+    async function exportNodes(format = 'http') {
+      hideExportModal();
+      try {
+        const url = format === 'surge' ? '/api/export?format=surge' : '/api/export';
+        const res = await fetch(url);
         if (res.status === 401) {
           showToast('请先登录', 'error');
           document.getElementById('loginOverlay').classList.add('show');
@@ -1232,16 +1405,17 @@
         }
 
         const blob = await res.blob();
-        const url = window.URL.createObjectURL(blob);
+        const downloadUrl = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
-        a.href = url;
-        a.download = 'nodes.txt';
+        a.href = downloadUrl;
+        a.download = format === 'surge' ? 'surge_proxies.conf' : 'nodes.txt';
         document.body.appendChild(a);
         a.click();
-        window.URL.revokeObjectURL(url);
+        window.URL.revokeObjectURL(downloadUrl);
         document.body.removeChild(a);
 
-        showToast('节点导出成功！', 'success');
+        const formatName = format === 'surge' ? 'Surge' : 'HTTP';
+        showToast(`${formatName} 格式导出成功！`, 'success');
       } catch (err) {
         showToast('导出失败: ' + err.message, 'error');
       }
