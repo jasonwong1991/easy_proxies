@@ -206,6 +206,8 @@
       transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
       position: relative;
       overflow: hidden;
+      content-visibility: auto;
+      contain-intrinsic-size: 280px;
     }
 
     .node-card::before {
@@ -883,6 +885,26 @@
       .config-node-card { flex-direction: column; align-items: stretch; }
       .config-node-actions { justify-content: flex-end; }
     }
+
+    /* Performance mode: reduce expensive blur/shadow/transform when many nodes are shown */
+    body.perf-mode .node-card,
+    body.perf-mode .stat-card,
+    body.perf-mode .btn,
+    body.perf-mode .status-line,
+    body.perf-mode .toast,
+    body.perf-mode .login-modal,
+    body.perf-mode .probe-progress {
+      backdrop-filter: none !important;
+      box-shadow: var(--shadow-sm) !important;
+    }
+
+    body.perf-mode .node-card:hover,
+    body.perf-mode .stat-card:hover,
+    body.perf-mode .btn-primary:hover,
+    body.perf-mode .btn-secondary:hover {
+      transform: none !important;
+      box-shadow: var(--shadow-sm) !important;
+    }
   </style>
 </head>
 <body>
@@ -1170,6 +1192,13 @@
     let isAutoRefresh = true;
     let isAuthenticated = false;
 
+    let currentTab = 'monitor';
+    let refreshInFlight = false;
+
+    const AUTO_REFRESH_MS = 20000;        // 20s，降低频繁重绘
+    const PERF_MODE_THRESHOLD = 40;       // 节点数达到阈值自动关闭毛玻璃等效果
+    const nodeCardMap = new Map();        // tag -> HTMLElement
+
     // 检查是否需要登录
     async function checkAuth() {
       try {
@@ -1235,7 +1264,7 @@
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = 'nodes.txt';
+        a.download = 'proxy_pool.txt';
         document.body.appendChild(a);
         a.click();
         window.URL.revokeObjectURL(url);
@@ -1247,15 +1276,20 @@
       }
     }
 
-    function formatTime(timeStr) {
+    function formatTime(timeStr, nowTs) {
       if (!timeStr || timeStr === '0001-01-01T00:00:00Z') return '从未';
       const date = new Date(timeStr);
-      const now = new Date();
-      const diff = Math.floor((now - date) / 1000);
+      const now = typeof nowTs === 'number' ? nowTs : Date.now();
+      const diff = Math.floor((now - date.getTime()) / 1000);
       if (diff < 60) return `${diff}秒前`;
       if (diff < 3600) return `${Math.floor(diff / 60)}分钟前`;
       if (diff < 86400) return `${Math.floor(diff / 3600)}小时前`;
       return `${Math.floor(diff / 86400)}天前`;
+    }
+
+    function applyPerformanceMode(nodeCount) {
+      const enable = nodeCount >= PERF_MODE_THRESHOLD;
+      document.body.classList.toggle('perf-mode', enable);
     }
 
     function getLatencyQuality(ms) {
@@ -1292,111 +1326,227 @@
     }
 
     async function refresh() {
+      if (refreshInFlight) return;
+      refreshInFlight = true;
+
       try {
         const res = await fetch('/api/nodes');
         if (res.status === 401) {
-          // 需要登录
           isAuthenticated = false;
           document.getElementById('loginOverlay').classList.add('show');
           stopAutoRefresh();
           return;
         }
         if (!res.ok) throw new Error('请求失败');
+
         const data = await res.json();
-        render(data.nodes || []);
-        updateStats(data.nodes || []);
+        const nodes = data.nodes || [];
+
+        render(nodes);
+        updateStats(nodes);
         document.getElementById('lastUpdate').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN')}`;
       } catch (err) {
         showToast('刷新失败: ' + err.message, 'error');
+      } finally {
+        refreshInFlight = false;
       }
     }
 
     function updateStats(nodes) {
+      let healthy = 0;
+      let active = 0;
+      let blacklisted = 0;
+
+      for (const n of nodes) {
+        const fc = n.failure_count || 0;
+        const ac = n.active_connections || 0;
+        const bl = !!n.blacklisted;
+
+        active += ac;
+        if (bl) blacklisted++;
+        if (!bl && fc === 0) healthy++;
+      }
+
       document.getElementById('totalNodes').textContent = nodes.length;
-      document.getElementById('healthyNodes').textContent = nodes.filter(n => !n.blacklisted && n.failure_count === 0).length;
-      document.getElementById('activeConnections').textContent = nodes.reduce((sum, n) => sum + (n.active_connections || 0), 0);
-      document.getElementById('blacklistedNodes').textContent = nodes.filter(n => n.blacklisted).length;
+      document.getElementById('healthyNodes').textContent = healthy;
+      document.getElementById('activeConnections').textContent = active;
+      document.getElementById('blacklistedNodes').textContent = blacklisted;
     }
+
+
+    function createNodeCard(tag) {
+  const card = document.createElement('div');
+  card.className = 'node-card healthy';
+  card.dataset.tag = tag;
+
+  // 注意：模板里不注入 name/tag 等外部数据，全部用 textContent 更新，避免 XSS 且更快
+  card.innerHTML = `
+    <div class="node-header">
+      <div class="node-info">
+        <div class="node-name" data-field="name"></div>
+        <div class="node-tag" data-field="tag"></div>
+      </div>
+      <span class="status-badge healthy" data-field="status-badge">
+        <span class="status-icon"></span>
+        <span data-field="status-text"></span>
+      </span>
+    </div>
+
+    <div class="latency-display">
+      <div class="latency-info">
+        <div class="latency-icon">⚡</div>
+        <div class="latency-text">
+          <div class="latency-label">节点延迟</div>
+          <div class="latency-value" data-field="latency-value">—</div>
+          <div class="latency-quality" data-field="latency-quality">点击探测按钮测试延迟</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="metrics">
+      <div class="metric">
+        <div class="metric-label">监听端口</div>
+        <div class="metric-value" data-field="port">—</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">活跃连接</div>
+        <div class="metric-value success" data-field="active">0</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">失败次数</div>
+        <div class="metric-value" data-field="failure">0</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">运行模式</div>
+        <div class="metric-value" style="font-size: 16px; text-transform: uppercase;" data-field="mode">—</div>
+      </div>
+    </div>
+
+    <div class="time-info">
+      <div data-field="last-success"></div>
+      <div data-field="last-failure"></div>
+      <div data-field="blacklisted-until" style="display:none; color: var(--error);"></div>
+    </div>
+
+    <div class="node-footer">
+      <div style="flex: 1;"></div>
+      <button class="btn btn-secondary btn-sm" data-field="probe-btn">🔍 探测延迟</button>
+      <button class="btn btn-primary btn-sm" data-field="release-btn" style="display:none;">解除拉黑</button>
+    </div>
+  `;
+
+  const refs = {
+    name: card.querySelector('[data-field="name"]'),
+    tag: card.querySelector('[data-field="tag"]'),
+    statusBadge: card.querySelector('[data-field="status-badge"]'),
+    statusText: card.querySelector('[data-field="status-text"]'),
+    latencyValue: card.querySelector('[data-field="latency-value"]'),
+    latencyQuality: card.querySelector('[data-field="latency-quality"]'),
+    port: card.querySelector('[data-field="port"]'),
+    active: card.querySelector('[data-field="active"]'),
+    failure: card.querySelector('[data-field="failure"]'),
+    mode: card.querySelector('[data-field="mode"]'),
+    lastSuccess: card.querySelector('[data-field="last-success"]'),
+    lastFailure: card.querySelector('[data-field="last-failure"]'),
+    blacklistedUntil: card.querySelector('[data-field="blacklisted-until"]'),
+    probeBtn: card.querySelector('[data-field="probe-btn"]'),
+    releaseBtn: card.querySelector('[data-field="release-btn"]'),
+  };
+
+  // 绑定事件（避免在 HTML 里拼接 tag）
+  refs.probeBtn.addEventListener('click', () => probe(tag));
+  refs.releaseBtn.addEventListener('click', () => release(tag));
+
+  card._refs = refs;
+  return card;
+}
+
+function updateNodeCard(card, node, nowTs) {
+  const refs = card._refs;
+  const status = getNodeStatus(node);
+
+  card.classList.remove('healthy', 'warning', 'error', 'blacklisted');
+  card.classList.add(status);
+
+  refs.statusBadge.className = `status-badge ${status}`;
+  refs.statusText.textContent = getStatusText(status);
+
+  refs.name.textContent = node.name || node.tag;
+  refs.tag.textContent = node.tag;
+
+  const latency = (node.last_latency_ms ?? -1);
+  const quality = getLatencyQuality(latency);
+
+  refs.latencyValue.textContent = latency >= 0 ? String(latency) : '—';
+  if (latency >= 0) {
+    refs.latencyQuality.textContent = `${quality.text} · ${latency} ms`;
+    refs.latencyQuality.style.color = quality.color;
+  } else {
+    refs.latencyQuality.textContent = '点击探测按钮测试延迟';
+    refs.latencyQuality.style.color = '';
+  }
+
+  refs.port.textContent = node.port ? String(node.port) : '—';
+  refs.active.textContent = String(node.active_connections || 0);
+  refs.failure.textContent = String(node.failure_count || 0);
+  refs.failure.classList.toggle('error', (node.failure_count || 0) > 0);
+  refs.mode.textContent = node.mode || '—';
+
+  refs.lastSuccess.textContent = `✓ 最近成功: ${formatTime(node.last_success, nowTs)}`;
+  refs.lastFailure.textContent = `✗ 最近失败: ${formatTime(node.last_failure, nowTs)}`;
+
+  if (node.blacklisted) {
+    refs.blacklistedUntil.style.display = 'block';
+    refs.blacklistedUntil.textContent = `⚠ 拉黑至: ${new Date(node.blacklisted_until).toLocaleString('zh-CN')}`;
+    refs.releaseBtn.style.display = 'inline-flex';
+  } else {
+    refs.blacklistedUntil.style.display = 'none';
+    refs.blacklistedUntil.textContent = '';
+    refs.releaseBtn.style.display = 'none';
+  }
+}
 
     function render(nodes) {
       const container = document.getElementById('nodesContainer');
       const emptyState = document.getElementById('emptyState');
 
-      if (nodes.length === 0) {
+      if (!Array.isArray(nodes) || nodes.length === 0) {
+        nodeCardMap.clear();
         container.innerHTML = '';
         emptyState.style.display = 'block';
         return;
       }
 
       emptyState.style.display = 'none';
-      container.innerHTML = nodes.map(node => {
-        const status = getNodeStatus(node);
-        const latency = node.last_latency_ms || -1;
-        const quality = getLatencyQuality(latency);
+      applyPerformanceMode(nodes.length);
 
-        return `
-          <div class="node-card ${status}">
-            <div class="node-header">
-              <div class="node-info">
-                <div class="node-name">${node.name || node.tag}</div>
-                <div class="node-tag">${node.tag}</div>
-              </div>
-              <span class="status-badge ${status}">
-                <span class="status-icon"></span>
-                ${getStatusText(status)}
-              </span>
-            </div>
+      const nowTs = Date.now();
+      const seen = new Set();
+      const frag = document.createDocumentFragment();
 
-            <div class="latency-display">
-              <div class="latency-info">
-                <div class="latency-icon">⚡</div>
-                <div class="latency-text">
-                  <div class="latency-label">节点延迟</div>
-                  <div class="latency-value">${latency >= 0 ? latency : '—'}</div>
-                  ${latency >= 0 ? `<div class="latency-quality" style="color: ${quality.color}">${quality.text} · ${latency} ms</div>` : '<div class="latency-quality">点击探测按钮测试延迟</div>'}
-                </div>
-              </div>
-            </div>
+      for (const node of nodes) {
+        const tag = node.tag;
+        if (!tag) continue;
 
-            <div class="metrics">
-              <div class="metric">
-                <div class="metric-label">监听端口</div>
-                <div class="metric-value">${node.port || '—'}</div>
-              </div>
-              <div class="metric">
-                <div class="metric-label">活跃连接</div>
-                <div class="metric-value success">${node.active_connections || 0}</div>
-              </div>
-              <div class="metric">
-                <div class="metric-label">失败次数</div>
-                <div class="metric-value ${node.failure_count > 0 ? 'error' : ''}">${node.failure_count || 0}</div>
-              </div>
-              <div class="metric">
-                <div class="metric-label">运行模式</div>
-                <div class="metric-value" style="font-size: 16px; text-transform: uppercase;">${node.mode || '—'}</div>
-              </div>
-            </div>
+        let card = nodeCardMap.get(tag);
+        if (!card) {
+          card = createNodeCard(tag);
+          nodeCardMap.set(tag, card);
+        }
 
-            <div class="time-info">
-              <div>✓ 最近成功: ${formatTime(node.last_success)}</div>
-              <div>✗ 最近失败: ${formatTime(node.last_failure)}</div>
-              ${node.blacklisted ? `<div style="color: var(--error);">⚠ 拉黑至: ${new Date(node.blacklisted_until).toLocaleString('zh-CN')}</div>` : ''}
-            </div>
+        updateNodeCard(card, node, nowTs);
+        frag.appendChild(card);
+        seen.add(tag);
+      }
 
-            <div class="node-footer">
-              <div style="flex: 1;"></div>
-              <button class="btn btn-secondary btn-sm" onclick="probe('${node.tag}')">
-                🔍 探测延迟
-              </button>
-              ${node.blacklisted ? `
-                <button class="btn btn-primary btn-sm" onclick="release('${node.tag}')">
-                  解除拉黑
-                </button>
-              ` : ''}
-            </div>
-          </div>
-        `;
-      }).join('');
+      // 清理已经不存在的节点
+      for (const tag of Array.from(nodeCardMap.keys())) {
+        if (!seen.has(tag)) {
+          nodeCardMap.delete(tag);
+        }
+      }
+
+      container.replaceChildren(frag);
     }
 
     async function probe(tag) {
@@ -1482,35 +1632,38 @@
     }
 
     function handleProbeEvent(data) {
-      const progressFill = document.getElementById('probeProgressFill');
-      const progressStats = document.getElementById('probeProgressStats');
-      const successCountEl = document.getElementById('probeSuccessCount');
-      const failedCountEl = document.getElementById('probeFailedCount');
-      const currentNode = document.getElementById('probeCurrentNode');
+    const progressFill = document.getElementById('probeProgressFill');
+    const progressStats = document.getElementById('probeProgressStats');
+    const successCountEl = document.getElementById('probeSuccessCount');
+    const failedCountEl = document.getElementById('probeFailedCount');
+    const currentNode = document.getElementById('probeCurrentNode');
 
-      switch (data.type) {
-        case 'start':
-          progressStats.textContent = `0 / ${data.total}`;
-          currentNode.textContent = '开始探测...';
-          break;
-        case 'progress':
-          progressFill.style.width = `${data.progress}%`;
-          progressStats.textContent = `${data.current} / ${data.total}`;
-          if (data.error) {
-            failedCountEl.textContent = parseInt(failedCountEl.textContent) + 1;
-            currentNode.textContent = `❌ ${data.name}: ${data.error}`;
-          } else {
-            successCountEl.textContent = parseInt(successCountEl.textContent) + 1;
-            currentNode.textContent = `✅ ${data.name}: ${data.latency}ms`;
-          }
-          break;
-        case 'complete':
-          progressFill.style.width = '100%';
-          currentNode.textContent = `完成！成功 ${data.success}，失败 ${data.failed}`;
-          showToast(`探测完成！成功 ${data.success} 个，失败 ${data.failed} 个`, 'success');
-          break;
-      }
+    switch (data.type) {
+      case 'start':
+        progressStats.textContent = `0 / ${data.total}`;
+        currentNode.textContent = '开始探测...';
+        break;
+      case 'progress':
+        progressFill.style.width = `${data.progress}%`;
+        progressStats.textContent = `${data.current} / ${data.total}`;
+        if (data.error) {
+          failedCountEl.textContent = parseInt(failedCountEl.textContent) + 1;
+          currentNode.textContent = `❌ ${data.name}: ${data.error}`;
+        } else {
+          successCountEl.textContent = parseInt(successCountEl.textContent) + 1;
+          currentNode.textContent = `✅ ${data.name}: ${data.latency}ms`;
+        }
+        break;
+      case 'complete':
+        progressFill.style.width = '100%';
+        progressStats.textContent = `${data.total} / ${data.total}`;
+        successCountEl.textContent = data.success;
+        failedCountEl.textContent = data.failed;
+        currentNode.textContent = `完成！成功 ${data.success}，失败 ${data.failed}`;
+        showToast(`探测完成！成功 ${data.success} 个，失败 ${data.failed} 个`, 'success');
+        break;
     }
+  }
 
     async function release(tag) {
       try {
@@ -1543,8 +1696,14 @@
 
     function startAutoRefresh() {
       if (autoRefreshInterval) return;
-      autoRefreshInterval = setInterval(refresh, 10000);
+      autoRefreshInterval = setInterval(() => {
+        if (!isAuthenticated) return;
+        if (document.hidden) return;
+        if (currentTab !== 'monitor') return;
+        refresh();
+      }, AUTO_REFRESH_MS);
     }
+
 
     function stopAutoRefresh() {
       if (autoRefreshInterval) {
@@ -1819,6 +1978,16 @@
       document.querySelector(`.tab[onclick="switchTab('${tabName}')"]`).classList.add('active');
       document.getElementById(tabName + 'Tab').classList.add('active');
 
+      currentTab = tabName;
+
+      if (tabName === 'monitor') {
+        if (isAutoRefresh) startAutoRefresh();
+        refresh();
+        fetchSubscriptionStatus();
+      } else {
+        stopAutoRefresh();
+      }
+
       if (tabName === 'manage') {
         loadConfigNodes();
       } else if (tabName === 'debug') {
@@ -2057,6 +2226,16 @@
         refresh();
         fetchSubscriptionStatus();
         startAutoRefresh();
+        document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+          stopAutoRefresh();
+          return;
+        }
+        if (isAuthenticated && isAutoRefresh && currentTab === 'monitor') {
+          startAutoRefresh();
+          refresh();
+        }
+        });
       }
     })();
   </script>

@@ -157,7 +157,7 @@ func (c *Config) normalize() error {
 		c.MultiPort.Address = "0.0.0.0"
 	}
 	if c.MultiPort.BasePort == 0 {
-		c.MultiPort.BasePort = 28000
+		c.MultiPort.BasePort = 24000
 	}
 	if c.Management.Listen == "" {
 		c.Management.Listen = "127.0.0.1:9090"
@@ -367,7 +367,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 		c.MultiPort.Address = "0.0.0.0"
 	}
 	if c.MultiPort.BasePort == 0 {
-		c.MultiPort.BasePort = 28000
+		c.MultiPort.BasePort = 24000
 	}
 	if c.Management.Listen == "" {
 		c.Management.Listen = "127.0.0.1:9090"
@@ -529,11 +529,11 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 	content := string(body)
 
 	// Try to detect and parse different formats
-	return parseSubscriptionContent(content)
+	return ParseSubscriptionContent(content)
 }
 
-// parseSubscriptionContent tries to parse subscription content in various formats
-func parseSubscriptionContent(content string) ([]NodeConfig, error) {
+// ParseSubscriptionContent tries to parse subscription content in various formats.
+func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
 	content = strings.TrimSpace(content)
 
 	// Check if it's base64 encoded (common for v2ray subscriptions)
@@ -551,12 +551,24 @@ func parseSubscriptionContent(content string) ([]NodeConfig, error) {
 	}
 
 	// Check if it's YAML (Clash format)
-	if strings.Contains(content, "proxies:") {
+	if looksLikeClashYAML(content) {
 		return parseClashYAML(content)
 	}
 
 	// Parse as plain text (one URI per line)
 	return parseNodesFromContent(content)
+}
+
+// looksLikeClashYAML detects Clash YAML by finding a "proxies:" key at line start.
+// This avoids false positives when plain text contains "proxies:" inside comments or URLs.
+func looksLikeClashYAML(content string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "proxies:") {
+			return true
+		}
+	}
+	return false
 }
 
 // parseNodesFromContent parses nodes from plain text content (one URI per line)
@@ -916,21 +928,21 @@ func (c *Config) SaveNodes() error {
 		}
 	}
 
-	// Only update config.yaml if there are inline nodes to save
-	// and preserve the original config structure
-	if len(inlineNodes) > 0 {
-		// Read original config to preserve structure
-		data, err := os.ReadFile(c.filePath)
-		if err != nil {
-			return fmt.Errorf("read config: %w", err)
-		}
-		var saveCfg Config
-		if err := yaml.Unmarshal(data, &saveCfg); err != nil {
-			return fmt.Errorf("decode config: %w", err)
-		}
-		// Update only the inline nodes
-		saveCfg.Nodes = inlineNodes
+	// Update config.yaml nodes field if needed:
+	// - there are inline nodes, OR
+	// - on-disk config currently has inline nodes (e.g. user deleted all via WebUI)
+	data, err := os.ReadFile(c.filePath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	var saveCfg Config
+	if err := yaml.Unmarshal(data, &saveCfg); err != nil {
+		return fmt.Errorf("decode config: %w", err)
+	}
 
+	shouldWriteNodes := len(inlineNodes) > 0 || len(saveCfg.Nodes) > 0
+	if shouldWriteNodes {
+		saveCfg.Nodes = inlineNodes
 		newData, err := yaml.Marshal(&saveCfg)
 		if err != nil {
 			return fmt.Errorf("encode config: %w", err)

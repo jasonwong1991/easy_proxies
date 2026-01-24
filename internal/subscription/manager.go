@@ -3,7 +3,6 @@ package subscription
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -332,17 +331,9 @@ func (m *Manager) CheckNodesModified() bool {
 		return false // File doesn't exist or can't read
 	}
 
-	// Parse nodes from file content
-	var nodes []config.NodeConfig
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if isProxyURI(line) {
-			nodes = append(nodes, config.NodeConfig{URI: line})
-		}
+	nodes, err := config.ParseSubscriptionContent(string(data))
+	if err != nil {
+		return false
 	}
 
 	currentHash := m.computeNodesHash(nodes)
@@ -419,7 +410,7 @@ func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]con
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 
-	return parseSubscriptionContent(string(body))
+	return config.ParseSubscriptionContent(string(body))
 }
 
 // createNewConfig creates a new config with updated nodes while preserving other settings.
@@ -427,21 +418,7 @@ func (m *Manager) createNewConfig(nodes []config.NodeConfig) *config.Config {
 	// Deep copy base config
 	newCfg := *m.baseCfg
 
-	// Assign port numbers to nodes in multi-port mode
-	if newCfg.Mode == "multi-port" {
-		portCursor := newCfg.MultiPort.BasePort
-		for i := range nodes {
-			nodes[i].Port = portCursor
-			portCursor++
-			// Apply default credentials
-			if nodes[i].Username == "" {
-				nodes[i].Username = newCfg.MultiPort.Username
-				nodes[i].Password = newCfg.MultiPort.Password
-			}
-		}
-	}
-
-	// Process node names
+	// Process node names (ports are assigned later by NormalizeWithPortMap)
 	for i := range nodes {
 		nodes[i].Name = strings.TrimSpace(nodes[i].Name)
 		nodes[i].URI = strings.TrimSpace(nodes[i].URI)
@@ -463,71 +440,6 @@ func (m *Manager) createNewConfig(nodes []config.NodeConfig) *config.Config {
 
 	newCfg.Nodes = nodes
 	return &newCfg
-}
-
-// parseSubscriptionContent parses subscription content in various formats.
-// This is a simplified version - the full implementation is in config package.
-func parseSubscriptionContent(content string) ([]config.NodeConfig, error) {
-	content = strings.TrimSpace(content)
-
-	// Check if it's base64 encoded
-	if isBase64(content) {
-		decoded, err := base64.StdEncoding.DecodeString(content)
-		if err != nil {
-			decoded, err = base64.RawStdEncoding.DecodeString(content)
-			if err != nil {
-				return parseNodesFromContent(content)
-			}
-		}
-		content = string(decoded)
-	}
-
-	// Parse as plain text (one URI per line)
-	return parseNodesFromContent(content)
-}
-
-func isBase64(s string) bool {
-	s = strings.TrimSpace(s)
-	if len(s) == 0 {
-		return false
-	}
-	s = strings.ReplaceAll(s, "\n", "")
-	s = strings.ReplaceAll(s, "\r", "")
-	if strings.Contains(s, "://") {
-		return false
-	}
-	_, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		_, err = base64.RawStdEncoding.DecodeString(s)
-	}
-	return err == nil
-}
-
-func parseNodesFromContent(content string) ([]config.NodeConfig, error) {
-	var nodes []config.NodeConfig
-	lines := strings.Split(content, "\n")
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if isProxyURI(line) {
-			nodes = append(nodes, config.NodeConfig{URI: line})
-		}
-	}
-	return nodes, nil
-}
-
-func isProxyURI(s string) bool {
-	schemes := []string{"vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://"}
-	lower := strings.ToLower(s)
-	for _, scheme := range schemes {
-		if strings.HasPrefix(lower, scheme) {
-			return true
-		}
-	}
-	return false
 }
 
 type defaultLogger struct{}

@@ -496,7 +496,7 @@ services:
     restart: unless-stopped
     ports:
       - "2323:2323"       # Pool/Hybrid mode entry
-      - "9091:9091"       # Web dashboard
+      - "9090:9090"       # Web dashboard
       - "24000-24200:24000-24200"  # Multi-Port/Hybrid mode
     volumes:
       - ./config.yaml:/etc/easy-proxies/config.yaml
