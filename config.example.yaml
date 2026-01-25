@@ -1,20 +1,34 @@
-mode: pool  # pool 或 multi-port（也支持 multi_port）
+# Easy Proxies 配置示例
+# 运行模式：
+#   - pool:      单入口代理池（2323），自动挑选可用节点
+#   - multi-port:多端口模式（24000+），每个节点独立端口
+#   - hybrid:    同时启用 pool + multi-port，状态共享
+mode: pool  # pool / multi-port / hybrid（也支持 multi_port）
+
 log_level: info
-skip_cert_verify: false  # 全局跳过 SSL 证书验证（默认 false）
+skip_cert_verify: false  # 全局跳过 TLS 证书验证（不建议长期开启）
+external_ip: ""          # 导出时用于替换 0.0.0.0（Docker/NAT 环境建议填公网 IP 或域名）
+
 management:
   enabled: true
   listen: 0.0.0.0:9090
   probe_target: www.apple.com:80
-  password: ""  # WebUI 访问密码，为空则不需要密码（可选）
+  password: ""  # 若 WebUI 暴露公网，务必设置强密码
+
+# Pool/Hybrid 统一入口（mixed：同端口支持 HTTP Proxy + SOCKS5）
 listener:
   address: 0.0.0.0
   port: 2323
   username: username
   password: password
+
+# 代理池策略与失败处理
 pool:
-  mode: sequential
-  failure_threshold: 3
-  blacklist_duration: 24h
+  mode: balance          # sequential / random / balance
+  failure_threshold: 1   # 公共 HTTP/SOCKS 列表建议 1~2
+  blacklist_duration: 10m # 建议不要用 24h，避免好节点集过度收缩
+
+# Multi-Port/Hybrid：每个节点独立端口（同样是 mixed：HTTP + SOCKS5）
 multi_port:
   address: 0.0.0.0
   base_port: 24000
@@ -22,26 +36,51 @@ multi_port:
   password: mppass
 
 # ═══════════════════════════════════════════════════════════════
-# 节点配置方式（三选一或混合使用）
+# 节点来源（可三选一或混用）
 # ═══════════════════════════════════════════════════════════════
 
-# 方式 1: 使用 nodes_file（推荐，最简单）
-# 创建一个文本文件，每行一个代理 URI
-# nodes_file: nodes.txt
+# 方式 1：nodes_file（推荐）
+nodes_file: nodes.txt
 
-# 方式 2: 直接在配置文件中配置（传统方式）
-nodes:
-  # 只需提供 URI，名称会自动从 #后面提取，端口自动分配
-  - uri: "vless://uuid@server:443#节点名称"
-  - uri: "ss://base64@server:8388#🇨🇳中文节点"
+# 方式 2：直接在配置里写 nodes（可选）
+# nodes:
+#     只需提供 URI，名称会自动从 #后面提取，端口自动分配
+#   - uri: "socks5://user:pass@198.51.100.10:1080#示例SOCKS5"
+#   - uri: "http://203.0.113.10:8080#示例HTTP"
+#   - uri: "https://203.0.113.11:443?sni=www.bing.com&allowInsecure=1#示例HTTPS"
+#   - uri: "vless://uuid@server:443#节点名称"
+#   - uri: "ss://base64@server:8388#🇨🇳中文节点"
 
-  # 也可以手动指定名称和端口
-  - name: tw-vless
-    uri: "vless://test"
-    port: 24001
+#     也可以手动指定名称和端口
+#   - name: tw-vless
+#     uri: "vless://test"
+#     port: 24001
 
-# 方式 3: 混合使用（两种方式的节点会合并）
+# 方式 3：subscriptions（推荐，支持 Base64 / Clash YAML / 纯文本）
+# 注意：配置 subscriptions 时，本项目会以订阅为主，并将解析出的节点写入 nodes_file（默认 nodes.txt）
+subscriptions:
+  # Clash YAML（proxies:），支持 type: http / type: socks5
+  # - "https://wslzgmzs.com/clash.yaml"
+
+  # 纯文本：每行一个 URI（http://...、https://...、socks5://...）
+  # - "https://raw.githubusercontent.com/Proxy/socks5-1.txt"
+  # - "https://raw.githubusercontent.com/Proxy/http-1.txt"
+
+  # 纯文本：每行 host:port（需要通过 #hint 指定默认协议）
+  # - "https://raw.githubusercontent.com/Proxy/socks5-2.txt#socks5"
+  # - "https://raw.githubusercontent.com/Proxy/http-2.txt#http"
+  # - "https://raw.githubusercontent.com/Proxy/https-2.txt#https"
+
+# 方式 4: 混合使用（两种方式的节点会合并）
 # nodes_file: nodes.txt
 # nodes:
 #   - uri: "vless://xxx@server:443#额外节点"
 
+# 订阅定时刷新（开启会触发内核 reload，现有连接会中断）
+subscription_refresh:
+  enabled: false
+  interval: 1h
+  timeout: 30s
+  health_check_timeout: 60s
+  drain_timeout: 30s
+  min_available_nodes: 1

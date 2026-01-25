@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -482,18 +483,25 @@ func (c *Config) ManagementEnabled() bool {
 	return *c.Management.Enabled
 }
 
-// loadNodesFromFile reads a nodes file where each line is a proxy URI
-// Lines starting with # are comments, empty lines are ignored
+// loadNodesFromFile reads a nodes file where each line is a proxy URI.
+// Lines starting with # are comments, empty lines are ignored.
+// Additionally supports plain "host:port" lines (default scheme derived from filename).
 func loadNodesFromFile(path string) ([]NodeConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return parseNodesFromContent(string(data))
+
+	defaultScheme := defaultPlainSchemeFromName(filepath.Base(path), "")
+	return parseNodesFromContentWithHint(string(data), defaultScheme)
 }
 
-// loadNodesFromSubscription fetches and parses nodes from a subscription URL
+// loadNodesFromSubscription fetches and parses nodes from a subscription URL.
 // Supports multiple formats: base64 encoded, plain text, clash yaml, etc.
+// For plain "host:port" lists, you can add a fragment hint:
+//   - https://example.com/list.txt#socks5
+//   - https://example.com/list.txt#http
+//   - https://example.com/list.txt#https
 func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConfig, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -502,7 +510,16 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 		Timeout: timeout,
 	}
 
-	req, err := http.NewRequest("GET", subURL, nil)
+	requestURL := subURL
+	defaultScheme := "http"
+
+	if u, err := url.Parse(subURL); err == nil && u != nil {
+		defaultScheme = defaultPlainSchemeFromName(u.Path, u.Fragment)
+		u.Fragment = ""
+		requestURL = u.String()
+	}
+
+	req, err := http.NewRequest("GET", requestURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -527,13 +544,12 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 	}
 
 	content := string(body)
-
-	// Try to detect and parse different formats
-	return ParseSubscriptionContent(content)
+	return ParseSubscriptionContentWithHint(content, defaultScheme)
 }
 
-// ParseSubscriptionContent tries to parse subscription content in various formats.
-func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
+// ParseSubscriptionContentWithHint parses subscription content in various formats.
+// defaultScheme is used when parsing plain "host:port" lists (e.g., socks5/http/https).
+func ParseSubscriptionContentWithHint(content string, defaultScheme string) ([]NodeConfig, error) {
 	content = strings.TrimSpace(content)
 
 	// Check if it's base64 encoded (common for v2ray subscriptions)
@@ -544,7 +560,7 @@ func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
 			decoded, err = base64.RawStdEncoding.DecodeString(content)
 			if err != nil {
 				// Not base64, try as plain text
-				return parseNodesFromContent(content)
+				return parseNodesFromContentWithHint(content, defaultScheme)
 			}
 		}
 		content = string(decoded)
@@ -555,8 +571,13 @@ func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
 		return parseClashYAML(content)
 	}
 
-	// Parse as plain text (one URI per line)
-	return parseNodesFromContent(content)
+	// Parse as plain text (one URI per line / or host:port list)
+	return parseNodesFromContentWithHint(content, defaultScheme)
+}
+
+// ParseSubscriptionContent tries to parse subscription content in various formats.
+func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
+	return ParseSubscriptionContentWithHint(content, "")
 }
 
 // looksLikeClashYAML detects Clash YAML by finding a "proxies:" key at line start.
@@ -571,10 +592,22 @@ func looksLikeClashYAML(content string) bool {
 	return false
 }
 
-// parseNodesFromContent parses nodes from plain text content (one URI per line)
+// parseNodesFromContent parses nodes from plain text content.
+// Supports:
+// - one URI per line (vmess://, vless://, http://, socks5://, ...)
+// - plain host:port list (converted to defaultScheme://host:port)
 func parseNodesFromContent(content string) ([]NodeConfig, error) {
+	return parseNodesFromContentWithHint(content, "")
+}
+
+func parseNodesFromContentWithHint(content string, defaultScheme string) ([]NodeConfig, error) {
 	var nodes []NodeConfig
 	lines := strings.Split(content, "\n")
+
+	scheme := normalizePlainSchemeHint(defaultScheme)
+	if scheme == "" {
+		scheme = "http"
+	}
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -584,18 +617,97 @@ func parseNodesFromContent(content string) ([]NodeConfig, error) {
 			continue
 		}
 
-		// Check if it's a valid proxy URI
-		if isProxyURI(line) {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		token := strings.TrimSpace(fields[0])
+		if token == "" || strings.HasPrefix(token, "#") {
+			continue
+		}
+
+		// Case 1: full URI
+		if isProxyURI(token) {
+			node := NodeConfig{URI: token}
+
+			// If no name in fragment, use host:port to make tags stable
+			if u, err := url.Parse(token); err == nil && u != nil {
+				if u.Fragment != "" {
+					if decoded, err := url.QueryUnescape(u.Fragment); err == nil && decoded != "" {
+						node.Name = decoded
+					} else {
+						node.Name = u.Fragment
+					}
+				} else if u.Host != "" {
+					node.Name = u.Host
+				}
+			}
+
+			nodes = append(nodes, node)
+			continue
+		}
+
+		// Case 2: host:port list -> convert to scheme://host:port
+		if hostport, ok := normalizeHostPort(token); ok {
 			nodes = append(nodes, NodeConfig{
-				URI: line,
+				Name: hostport,
+				URI:  fmt.Sprintf("%s://%s", scheme, hostport),
 			})
+			continue
 		}
 	}
 
 	return nodes, nil
 }
 
-// isBase64 checks if a string looks like base64 encoded content
+func normalizeHostPort(token string) (string, bool) {
+	if strings.Contains(token, "://") {
+		return "", false
+	}
+
+	// Reject unbracketed IPv6 (avoid treating it as host:port)
+	if strings.Count(token, ":") > 1 && !strings.HasPrefix(token, "[") {
+		return "", false
+	}
+
+	_, portStr, err := net.SplitHostPort(token)
+	if err != nil {
+		return "", false
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil || p <= 0 || p > 65535 {
+		return "", false
+	}
+	return token, true
+}
+
+func normalizePlainSchemeHint(value string) string {
+	v := strings.ToLower(strings.TrimSpace(value))
+	switch v {
+	case "http", "https", "socks5", "socks5h":
+		return v
+	case "socks":
+		return "socks5"
+	default:
+		return ""
+	}
+}
+
+func defaultPlainSchemeFromName(nameHint string, explicitHint string) string {
+	if v := normalizePlainSchemeHint(explicitHint); v != "" {
+		return v
+	}
+	lower := strings.ToLower(nameHint)
+	if strings.Contains(lower, "socks5") || strings.Contains(lower, "socks") {
+		return "socks5"
+	}
+	if strings.Contains(lower, "http") {
+		return "http"
+	}
+	return "http"
+}
+
+// isBase64 checks if a string looks like base64 encoded content.
 func isBase64(s string) bool {
 	// Remove whitespace
 	s = strings.TrimSpace(s)
@@ -603,8 +715,6 @@ func isBase64(s string) bool {
 		return false
 	}
 
-	// Base64 should not contain newlines in the middle (unless it's multi-line base64)
-	// and should only contain valid base64 characters
 	s = strings.ReplaceAll(s, "\n", "")
 	s = strings.ReplaceAll(s, "\r", "")
 
@@ -621,44 +731,51 @@ func isBase64(s string) bool {
 	return err == nil
 }
 
-// isProxyURI checks if a string is a valid proxy URI
+// isProxyURI checks if a string is a valid proxy URI.
 func isProxyURI(s string) bool {
-	schemes := []string{"vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://"}
+	schemes := []string{
+		"vmess://", "vless://", "trojan://", "ss://", "ssr://",
+		"hysteria://", "hysteria2://", "hy2://",
+		"http://", "https://",
+		"socks://", "socks5://", "socks5h://", "socks4://", "socks4a://",
+	}
+	lower := strings.ToLower(s)
 	for _, scheme := range schemes {
-		if strings.HasPrefix(strings.ToLower(s), scheme) {
+		if strings.HasPrefix(lower, scheme) {
 			return true
 		}
 	}
 	return false
 }
 
-// clashConfig represents a minimal Clash configuration for parsing proxies
+// clashConfig represents a minimal Clash configuration for parsing proxies.
 type clashConfig struct {
 	Proxies []clashProxy `yaml:"proxies"`
 }
 
 type clashProxy struct {
-	Name           string                 `yaml:"name"`
-	Type           string                 `yaml:"type"`
-	Server         string                 `yaml:"server"`
-	Port           int                    `yaml:"port"`
-	UUID           string                 `yaml:"uuid"`
-	Password       string                 `yaml:"password"`
-	Cipher         string                 `yaml:"cipher"`
-	AlterId        int                    `yaml:"alterId"`
-	Network        string                 `yaml:"network"`
-	TLS            bool                   `yaml:"tls"`
-	SkipCertVerify bool                   `yaml:"skip-cert-verify"`
-	ServerName     string                 `yaml:"servername"`
-	SNI            string                 `yaml:"sni"`
-	Flow           string                 `yaml:"flow"`
-	UDP            bool                   `yaml:"udp"`
-	WSOpts         *clashWSOptions        `yaml:"ws-opts"`
-	GrpcOpts       *clashGrpcOptions      `yaml:"grpc-opts"`
-	RealityOpts    *clashRealityOptions   `yaml:"reality-opts"`
-	ClientFingerprint string              `yaml:"client-fingerprint"`
-	Plugin         string                 `yaml:"plugin"`
-	PluginOpts     map[string]interface{} `yaml:"plugin-opts"`
+	Name              string                 `yaml:"name"`
+	Type              string                 `yaml:"type"`
+	Server            string                 `yaml:"server"`
+	Port              int                    `yaml:"port"`
+	UUID              string                 `yaml:"uuid"`
+	Username          string                 `yaml:"username"`
+	Password          string                 `yaml:"password"`
+	Cipher            string                 `yaml:"cipher"`
+	AlterId           int                    `yaml:"alterId"`
+	Network           string                 `yaml:"network"`
+	TLS               bool                   `yaml:"tls"`
+	SkipCertVerify    bool                   `yaml:"skip-cert-verify"`
+	ServerName        string                 `yaml:"servername"`
+	SNI               string                 `yaml:"sni"`
+	Flow              string                 `yaml:"flow"`
+	UDP               bool                   `yaml:"udp"`
+	WSOpts            *clashWSOptions        `yaml:"ws-opts"`
+	GrpcOpts          *clashGrpcOptions      `yaml:"grpc-opts"`
+	RealityOpts       *clashRealityOptions   `yaml:"reality-opts"`
+	ClientFingerprint string                 `yaml:"client-fingerprint"`
+	Plugin            string                 `yaml:"plugin"`
+	PluginOpts        map[string]interface{} `yaml:"plugin-opts"`
 }
 
 type clashWSOptions struct {
@@ -675,7 +792,7 @@ type clashRealityOptions struct {
 	ShortID   string `yaml:"short-id"`
 }
 
-// parseClashYAML parses Clash YAML format and converts to NodeConfig
+// parseClashYAML parses Clash YAML format and converts to NodeConfig.
 func parseClashYAML(content string) ([]NodeConfig, error) {
 	var clash clashConfig
 	if err := yaml.Unmarshal([]byte(content), &clash); err != nil {
@@ -696,7 +813,7 @@ func parseClashYAML(content string) ([]NodeConfig, error) {
 	return nodes, nil
 }
 
-// convertClashProxyToURI converts a Clash proxy config to a standard URI
+// convertClashProxyToURI converts a Clash proxy config to a standard URI.
 func convertClashProxyToURI(p clashProxy) string {
 	switch strings.ToLower(p.Type) {
 	case "vmess":
@@ -709,6 +826,10 @@ func convertClashProxyToURI(p clashProxy) string {
 		return buildShadowsocksURI(p)
 	case "hysteria2", "hy2":
 		return buildHysteria2URI(p)
+	case "http", "https":
+		return buildHTTPProxyURI(p)
+	case "socks5", "socks", "socks4", "socks4a":
+		return buildSocksProxyURI(p)
 	default:
 		return ""
 	}
@@ -851,6 +972,51 @@ func buildHysteria2URI(p clashProxy) string {
 	}
 
 	return fmt.Sprintf("hysteria2://%s@%s:%d%s#%s", p.Password, p.Server, p.Port, query, url.QueryEscape(p.Name))
+}
+
+func buildHTTPProxyURI(p clashProxy) string {
+	scheme := "http"
+	if p.TLS {
+		scheme = "https"
+	}
+
+	params := url.Values{}
+	sni := p.ServerName
+	if sni == "" {
+		sni = p.SNI
+	}
+	if sni != "" {
+		params.Set("sni", sni)
+	}
+	if p.SkipCertVerify {
+		params.Set("allowInsecure", "1")
+	}
+
+	query := ""
+	if len(params) > 0 {
+		query = "?" + params.Encode()
+	}
+
+	authPart := ""
+	if p.Username != "" {
+		authPart = url.UserPassword(p.Username, p.Password).String() + "@"
+	}
+
+	return fmt.Sprintf("%s://%s%s:%d%s#%s", scheme, authPart, p.Server, p.Port, query, url.QueryEscape(p.Name))
+}
+
+func buildSocksProxyURI(p clashProxy) string {
+	scheme := strings.ToLower(strings.TrimSpace(p.Type))
+	if scheme == "" || scheme == "socks" {
+		scheme = "socks5"
+	}
+
+	authPart := ""
+	if p.Username != "" {
+		authPart = url.UserPassword(p.Username, p.Password).String() + "@"
+	}
+
+	return fmt.Sprintf("%s://%s%s:%d#%s", scheme, authPart, p.Server, p.Port, url.QueryEscape(p.Name))
 }
 
 // FilePath returns the config file path.

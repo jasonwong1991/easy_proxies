@@ -382,12 +382,44 @@ func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
 	return allNodes, nil
 }
 
+func splitSubscriptionURL(raw string) (requestURL string, defaultScheme string) {
+	defaultScheme = "http"
+	requestURL = raw
+
+	u, err := url.Parse(raw)
+	if err != nil || u == nil {
+		return requestURL, defaultScheme
+	}
+
+	frag := strings.ToLower(strings.TrimSpace(u.Fragment))
+	switch frag {
+	case "http", "https", "socks5", "socks5h":
+		defaultScheme = frag
+	case "socks":
+		defaultScheme = "socks5"
+	default:
+		// If no explicit fragment hint, try simple heuristics based on URL path
+		pathLower := strings.ToLower(u.Path)
+		if strings.Contains(pathLower, "socks5") || strings.Contains(pathLower, "socks") {
+			defaultScheme = "socks5"
+		} else if strings.Contains(pathLower, "http") {
+			defaultScheme = "http"
+		}
+	}
+
+	u.Fragment = ""
+	requestURL = u.String()
+	return requestURL, defaultScheme
+}
+
 // fetchSubscription fetches and parses a single subscription URL.
 func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]config.NodeConfig, error) {
 	ctx, cancel := context.WithTimeout(m.ctx, timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", subURL, nil)
+	requestURL, defaultScheme := splitSubscriptionURL(subURL)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", requestURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -410,7 +442,7 @@ func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]con
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 
-	return config.ParseSubscriptionContent(string(body))
+	return config.ParseSubscriptionContentWithHint(string(body), defaultScheme)
 }
 
 // createNewConfig creates a new config with updated nodes while preserving other settings.

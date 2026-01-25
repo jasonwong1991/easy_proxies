@@ -204,10 +204,18 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 		m.logger.Info("starting health check for ", len(entries), " nodes")
 	}
 
-	workerLimit := runtime.NumCPU() * 2
-	if workerLimit < 8 {
-		workerLimit = 8
+	// 为大节点量场景提高并发，但避免过高造成抖动
+	workerLimit := runtime.NumCPU() * 4
+	if workerLimit < 16 {
+		workerLimit = 16
 	}
+	if workerLimit > 32 {
+		workerLimit = 32
+	}
+	if workerLimit > len(entries) {
+		workerLimit = len(entries)
+	}
+
 	sem := make(chan struct{}, workerLimit)
 	var wg sync.WaitGroup
 	var availableCount atomic.Int32
@@ -582,6 +590,16 @@ func (h *EntryHandle) SetRelease(fn func()) {
 		return
 	}
 	h.ref.setRelease(fn)
+}
+
+// Health returns current health-check status of the node.
+func (h *EntryHandle) Health() (initialCheckDone bool, available bool) {
+	if h == nil || h.ref == nil {
+		return false, true
+	}
+	h.ref.mu.RLock()
+	defer h.ref.mu.RUnlock()
+	return h.ref.initialCheckDone, h.ref.available
 }
 
 // MarkInitialCheckDone marks the initial health check as completed.

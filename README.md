@@ -2,522 +2,277 @@
 
 English | [简体中文](README_ZH.md)
 
-A proxy node pool management tool based on [sing-box](https://github.com/SagerNet/sing-box), supporting multiple protocols, automatic failover, and load balancing.
+Easy Proxies is a proxy pool manager built on top of [sing-box](https://github.com/SagerNet/sing-box).
+It supports multi-protocol nodes (VMess/VLESS/Trojan/SS/Hysteria2) and also upstream **HTTP/HTTPS/SOCKS** proxy nodes.
+It provides Pool / Multi-Port / Hybrid modes plus a Web dashboard for monitoring, probing, exporting and node management.
 
-## Features
+## Highlights
 
-- **Multi-Protocol Support**: VMess, VLESS, Hysteria2, Shadowsocks, Trojan
-- **Multiple Transports**: TCP, WebSocket, HTTP/2, gRPC, HTTPUpgrade
-- **Subscription Support**: Auto-fetch nodes from subscription links (Base64, Clash YAML, etc.)
-- **Subscription Auto-Refresh**: Automatic periodic refresh with WebUI manual trigger (⚠️ causes connection interruption)
-- **Pool Mode**: Automatic failover and load balancing
-- **Multi-Port Mode**: Each node listens on independent port
-- **Hybrid Mode**: Pool + Multi-Port simultaneously with shared node state
-- **Web Dashboard**: Real-time node status, latency probing, one-click export
-- **WebUI Settings**: Modify external_ip and probe_target without editing config files
-- **Password Protection**: WebUI authentication support
-- **Auto Health Check**: Initial check on startup, periodic checks every 5 minutes
-- **Smart Node Filtering**: Auto-hide unavailable nodes, sort by latency
-- **Port Preservation**: Existing nodes keep their ports when adding/updating nodes
-- **Flexible Configuration**: Config file, node file, subscription links
-- **Multi-Architecture**: Docker images for both AMD64 and ARM64
+- Mixed inbound entrypoints: **one port supports both HTTP Proxy and SOCKS5**
+- Upstream node schemes:
+  - `vmess://`, `vless://`, `trojan://`, `hysteria2://`, `ss://`
+  - `http://`, `https://` (HTTP proxy over TCP / TLS)
+  - `socks5://` (also accepts `socks://`, `socks4://`, `socks4a://`, `socks5h://`)
+- Subscription formats:
+  - Base64 (V2Ray-style)
+  - Clash YAML (`proxies:`), including `type: http` / `type: socks5`
+  - Plain text lists (`scheme://...` per line, or `host:port` list with a URL hint)
+- Pool mode with failover, blacklist, and **dial fallback retries**
+- Multi-Port mode: each node gets its own local port
+- Hybrid mode: Pool + Multi-Port at the same time
+- WebUI:
+  - Live node status, active connections, failures
+  - Manual probing and batch probing
+  - Export working endpoints as proxy URIs
+  - Node CRUD + reload
+  - Subscription refresh with status
 
 ## Quick Start
 
-### 1. Configuration
-
-Copy example config files:
+### 1) Prepare config
 
 ```bash
 cp config.example.yaml config.yaml
 cp nodes.example nodes.txt
 ```
 
-Edit `config.yaml` to set listen address and credentials, edit `nodes.txt` to add proxy nodes.
+Edit `config.yaml` and `nodes.txt`.
 
-### 2. Run
-
-**Docker (Recommended):**
-
-```bash
-./start.sh
-```
-
-Or manually:
+### 2) Run (Docker recommended)
 
 ```bash
 docker compose up -d
 ```
 
-**Local Build:**
+Or:
 
 ```bash
-go build -tags "with_utls with_quic with_grpc" -o easy-proxies ./cmd/easy_proxies
-./easy-proxies --config config.yaml
+./start.sh
+```
+
+### 3) Ports
+
+- Pool entry (Pool/Hybrid): `2323`
+- Web dashboard: `9090` (configured by `management.listen`)
+- Multi-Port range (Multi-Port/Hybrid): `24000+` (starts at `multi_port.base_port`)
+
+### 4) Connect (HTTP and SOCKS5 on the same port)
+
+Pool entry examples:
+
+- HTTP proxy:
+  - `http://username:password@127.0.0.1:2323`
+- SOCKS5 proxy:
+  - `socks5://username:password@127.0.0.1:2323`
+
+Test with curl:
+
+```bash
+# HTTP proxy test
+curl -I -x http://username:password@127.0.0.1:2323 http://example.com
+
+# SOCKS5 proxy test
+curl -I --socks5 username:password@127.0.0.1:2323 http://example.com
 ```
 
 ## Configuration
 
-### Basic Config
+### Basic example
 
 ```yaml
-mode: pool                    # Mode: pool, multi-port, or hybrid
-log_level: info               # Log level: debug, info, warn, error
-external_ip: ""               # External IP for export (recommended for Docker)
+mode: pool               # pool, multi-port, hybrid
+log_level: info
+skip_cert_verify: false  # global TLS cert verification switch (affects TLS-based nodes)
 
-# Subscription URLs (optional, multiple supported)
-subscriptions:
-  - "https://example.com/subscribe"
-
-# Management Interface
 management:
   enabled: true
-  listen: 0.0.0.0:9090        # Web dashboard address
-  probe_target: www.apple.com:80  # Latency probe target
-  password: ""                # WebUI password (optional)
+  listen: 0.0.0.0:9090
+  probe_target: www.apple.com:80
+  password: ""           # set a strong password if you expose WebUI to the Internet
 
-# Unified Entry Listener
 listener:
   address: 0.0.0.0
   port: 2323
   username: username
   password: password
 
-# Pool Settings
 pool:
-  mode: sequential            # sequential or random
-  failure_threshold: 3        # Failures before blacklist
-  blacklist_duration: 24h     # Blacklist duration
-
-# Multi-Port Mode
-multi_port:
-  address: 0.0.0.0
-  base_port: 24000            # Starting port, auto-increment
-  username: mpuser
-  password: mppass
-```
-
-### Operating Modes
-
-#### Pool Mode
-
-All nodes share a single entry point, program auto-selects available nodes:
-
-```yaml
-mode: pool
-
-listener:
-  address: 0.0.0.0
-  port: 2323
-  username: user
-  password: pass
-
-pool:
-  mode: sequential  # sequential or random
+  mode: sequential        # sequential, random, balance
   failure_threshold: 3
   blacklist_duration: 24h
-```
-
-**Use Case:** Automatic failover, load balancing
-
-**Usage:** Set proxy to `http://user:pass@localhost:2323`
-
-#### Multi-Port Mode
-
-Each node listens on its own port for precise control:
-
-**Config Format:** Two syntaxes supported
-
-```yaml
-mode: multi-port  # Recommended: hyphen format
-# or
-mode: multi_port  # Compatible: underscore format
-```
-
-**Full Example:**
-
-```yaml
-mode: multi-port
 
 multi_port:
   address: 0.0.0.0
-  base_port: 24000  # Ports auto-increment from here
-  username: user
-  password: pass
+  base_port: 24000
+  username: mpuser
+  password: mppass
 
+# Nodes configuration (you can mix multiple ways)
 nodes_file: nodes.txt
+# nodes:
+#   - uri: "socks5://1.2.3.4:1080#MySocks"
+#   - uri: "http://5.6.7.8:8080#MyHTTP"
+
+# Subscription URLs (optional, multiple supported)
+# Supports Base64, Clash YAML, plain text
+subscriptions:
+  - "https://example.com/subscription.yaml"
+  - "https://raw.githubusercontent.com/Proxy/socks5-2.txt"
+  # Plain host:port list needs a hint:
+  - "https://raw.githubusercontent.com/Proxy/socks5-1.txt#socks5"
+  - "https://raw.githubusercontent.com/Proxy/http-1.txt#http"
+
+subscription_refresh:
+  enabled: true
+  interval: 1h
+  timeout: 30s
+  health_check_timeout: 60s
+  drain_timeout: 30s
+  min_available_nodes: 1
 ```
 
-**Startup Output:**
+## Modes
+
+### Pool mode
+
+- One entry port (`listener.port`)
+- Requests are routed through one upstream node selected by the pool strategy
+
+### Multi-Port mode
+
+- Each node listens on its own local port, starting from `multi_port.base_port`
+- Each per-node port is also a mixed inbound (HTTP + SOCKS5)
+
+### Hybrid mode
+
+- Pool entry + Multi-Port entries simultaneously
+- Node blacklist / active counters are shared
+
+## Nodes
+
+### Supported URI schemes for nodes
+
+You can place any of these in `nodes:` or `nodes.txt`:
+
+- VMess: `vmess://...`
+- VLESS: `vless://...`
+- Trojan: `trojan://...`
+- Shadowsocks: `ss://...`
+- Hysteria2: `hysteria2://...`
+- HTTP proxy upstream:
+  - `http://host:port`
+  - `https://host:port`
+  - If you need TLS but the list only provides `host:443`, use:
+    - `https://host:443`
+    - or `http://host:443?tls=1&sni=example.com`
+- SOCKS upstream:
+  - `socks5://host:port`
+  - (also accepted: `socks://`, `socks4://`, `socks4a://`, `socks5h://`)
+
+### Plain host:port lists
+
+Some subscriptions provide only:
 
 ```
-📡 Proxy Links:
-═══════════════════════════════════════════════════════════════
-🔌 Multi-Port Mode (3 nodes):
-
-   [24000] Taiwan Node
-       http://user:pass@0.0.0.0:24000
-   [24001] Hong Kong Node
-       http://user:pass@0.0.0.0:24001
-   [24002] US Node
-       http://user:pass@0.0.0.0:24002
-═══════════════════════════════════════════════════════════════
+146.103.98.171:54101
+31.43.179.38:80
 ```
 
-**Use Case:** Specific node selection, performance testing
+This is ambiguous (HTTP? SOCKS?). For **subscription URLs**, you can add a fragment hint:
 
-**Usage:** Each node has independent proxy address
+- `#socks5` => treat all `host:port` lines as `socks5://host:port`
+- `#http`   => treat as `http://host:port`
+- `#https`  => treat as `https://host:port`
 
-#### Hybrid Mode
-
-Combines Pool and Multi-Port modes, sharing node state between them:
-
-```yaml
-mode: hybrid
-
-listener:
-  address: 0.0.0.0
-  port: 2323           # Pool entry point
-  username: user
-  password: pass
-
-multi_port:
-  address: 0.0.0.0
-  base_port: 24000     # Multi-port starting port
-  username: mpuser
-  password: mppass
-
-pool:
-  mode: balance        # sequential, random, or balance
-  failure_threshold: 3
-  blacklist_duration: 24h
-```
-
-**Startup Output:**
-
-```
-📡 Proxy Links:
-═══════════════════════════════════════════════════════════════
-🌐 Pool Entry Point:
-   http://user:pass@0.0.0.0:2323
-
-   Nodes in pool (3):
-   • Taiwan Node
-   • Hong Kong Node
-   • US Node
-
-🔌 Multi-Port Entry Points (3 nodes):
-
-   [24000] Taiwan Node
-       http://mpuser:mppass@0.0.0.0:24000
-   [24001] Hong Kong Node
-       http://mpuser:mppass@0.0.0.0:24001
-   [24002] US Node
-       http://mpuser:mppass@0.0.0.0:24002
-═══════════════════════════════════════════════════════════════
-```
-
-**Key Features:**
-
-- **Shared State**: Node blacklist status syncs between Pool and Multi-Port
-  - If a node fails in Pool mode, it's also marked unavailable in Multi-Port
-  - Health checks update both modes simultaneously
-- **Auto Port Reassignment**: If a port is occupied, automatically assigns next available port
-- **Flexible Access**: Use Pool for load balancing, Multi-Port for specific node access
-
-**Use Case:** Need both automatic failover AND direct node access
-
-### Node Configuration
-
-**Method 1: Subscription Links (Recommended)**
-
-Auto-fetch nodes from subscription URLs:
+Example:
 
 ```yaml
 subscriptions:
-  - "https://example.com/subscribe/v2ray"
-  - "https://example.com/subscribe/clash"
+  - "https://raw.githubusercontent.com/Proxy/socks5-1.txt#socks5"
+  - "https://raw.githubusercontent.com/Proxy/http-1.txt#http"
 ```
 
-Supported formats:
-- **Base64 Encoded**: V2Ray standard subscription
-- **Clash YAML**: Clash config format
-- **Plain Text**: One URI per line
+If the list already contains `socks5://...` / `http://...`, no hint is needed.
 
-**Method 2: Node File**
+## Health Check & Reliability
 
-Specify in `config.yaml`:
+- The probe target is `management.probe_target` (default: `www.apple.com:80`)
+- On startup and periodically, Easy Proxies probes nodes and marks them available/unavailable
+- Pool selection skips nodes that have already been checked and marked unavailable
+- Dial fallback: on connection failure, the pool automatically retries up to a few different nodes before returning an error to the client
+
+Recommended settings for large public proxy lists (unstable by nature):
 
 ```yaml
-nodes_file: nodes.txt
+pool:
+  failure_threshold: 1
+  blacklist_duration: 10m
 ```
 
-`nodes.txt` - one URI per line:
-
-```
-vless://uuid@server:443?security=reality&sni=example.com#NodeName
-hysteria2://password@server:443?sni=example.com#HY2Node
-ss://base64@server:8388#SSNode
-trojan://password@server:443?sni=example.com#TrojanNode
-vmess://base64...#VMessNode
-```
-
-**Method 3: Direct in Config**
+Also consider switching to:
 
 ```yaml
-nodes:
-  - uri: "vless://uuid@server:443#Node1"
-  - name: custom-name
-    uri: "ss://base64@server:8388"
-    port: 24001  # Optional, manual port
+pool:
+  mode: balance
 ```
-
-> **Tip**: Multiple methods can be combined, nodes are merged automatically.
-
-## Supported Protocols
-
-| Protocol | URI Format | Features |
-|----------|------------|----------|
-| VMess | `vmess://` | WebSocket, HTTP/2, gRPC, TLS |
-| VLESS | `vless://` | Reality, XTLS-Vision, multiple transports |
-| Hysteria2 | `hysteria2://` | Bandwidth control, obfuscation |
-| Shadowsocks | `ss://` | Multiple ciphers |
-| Trojan | `trojan://` | TLS, multiple transports |
-
-### VMess Parameters
-
-VMess supports two URI formats:
-
-**Format 1: Base64 JSON (Standard)**
-```
-vmess://base64({"v":"2","ps":"Name","add":"server","port":443,"id":"uuid","aid":0,"scy":"auto","net":"ws","type":"","host":"example.com","path":"/path","tls":"tls","sni":"example.com"})
-```
-
-**Format 2: URL Format**
-```
-vmess://uuid@server:port?encryption=auto&security=tls&sni=example.com&type=ws&host=example.com&path=/path#Name
-```
-
-- `net/type`: tcp, ws, h2, grpc
-- `tls/security`: tls or empty
-- `scy/encryption`: auto, aes-128-gcm, chacha20-poly1305, etc.
-
-### VLESS Parameters
-
-```
-vless://uuid@server:port?encryption=none&security=reality&sni=example.com&fp=chrome&pbk=xxx&sid=xxx&type=tcp&flow=xtls-rprx-vision#Name
-```
-
-- `security`: none, tls, reality
-- `type`: tcp, ws, http, grpc, httpupgrade
-- `flow`: xtls-rprx-vision (TCP only)
-- `fp`: fingerprint (chrome, firefox, safari, etc.)
-
-### Hysteria2 Parameters
-
-```
-hysteria2://password@server:port?sni=example.com&insecure=0&obfs=salamander&obfs-password=xxx#Name
-```
-
-- `upMbps` / `downMbps`: Bandwidth limits
-- `obfs`: Obfuscation type
-- `obfs-password`: Obfuscation password
 
 ## Web Dashboard
 
-Access `http://localhost:9090` to view:
+Open: `http://<host>:9090`
 
-- Node status (Healthy/Warning/Error/Blacklisted)
-- Real-time latency
-- Active connections
-- Failure count
-- Manual latency probing
-- Release blacklisted nodes
-- **One-click Export**: Export all available nodes as proxy URIs (`http://user:pass@host:port`)
-- **Settings**: Click the gear icon to modify `external_ip` and `probe_target` (changes saved immediately)
+Main features:
 
-### WebUI Settings
+- Monitor nodes
+- Manual probe and probe-all
+- Export available endpoints
+- Node management (add/edit/delete) + reload
+- Subscription refresh status + manual refresh
 
-Click the ⚙️ gear icon in the header to access settings:
+Important note:
 
-| Setting | Description |
-|---------|-------------|
-| External IP | IP address used in exported proxy URIs (replaces `0.0.0.0`) |
-| Probe Target | Health check target address (format: `host:port`) |
+- Subscription refresh triggers a core reload and will interrupt existing connections.
 
-Changes are saved to `config.yaml` immediately and take effect without restart.
+## Docker
 
-### Node Management
-
-The Web UI provides a **Node Management** tab for CRUD operations on proxy nodes:
-
-- **Add Node**: Add new proxy nodes via URI (name auto-extracted from URI fragment)
-- **Edit Node**: Modify existing node configuration
-- **Delete Node**: Remove nodes from configuration
-- **Reload Config**: Apply changes by restarting sing-box core (⚠️ interrupts connections)
-- **Port Preservation**: Existing nodes keep their assigned ports after reload
-
-In Multi-Port mode, ports are automatically allocated from `base_port`.
-
-**API Endpoints:**
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/nodes/config` | List all configured nodes |
-| POST | `/api/nodes/config` | Add a new node |
-| PUT | `/api/nodes/config/:name` | Update node by name |
-| DELETE | `/api/nodes/config/:name` | Delete node by name |
-| POST | `/api/reload` | Reload configuration |
-| GET | `/api/settings` | Get current settings |
-| PUT | `/api/settings` | Update settings (external_ip, probe_target) |
-
-**Request/Response Example:**
-
-```bash
-# Add node
-curl -X POST http://localhost:9090/api/nodes/config \
-  -H "Content-Type: application/json" \
-  -d '{"uri": "vless://uuid@server:443#NodeName"}'
-
-# Delete node
-curl -X DELETE http://localhost:9090/api/nodes/config/NodeName
-
-# Reload config
-curl -X POST http://localhost:9090/api/reload
-```
-
-### Health Check Mechanism
-
-Auto health check on startup, then periodic checks:
-
-- **Initial Check**: Test all nodes immediately after startup
-- **Periodic Check**: Every 5 minutes
-- **Smart Filtering**: Hide unavailable nodes from WebUI and export
-- **Probe Target**: Configure via `management.probe_target` (default `www.apple.com:80`)
+### Option A: host network (recommended)
 
 ```yaml
-management:
-  enabled: true
-  listen: 0.0.0.0:9090
-  probe_target: www.apple.com:80  # Health check target
-```
-
-### Password Protection
-
-Protect node information with WebUI password:
-
-```yaml
-management:
-  enabled: true
-  listen: 0.0.0.0:9090
-  password: "your_secure_password"
-```
-
-- Empty or unset `password` means no authentication required
-- Login prompt appears on first access when password is set
-- Session persists for 7 days after login
-
-### Subscription Auto-Refresh
-
-Automatic periodic subscription refresh:
-
-```yaml
-subscription_refresh:
-  enabled: true                 # Enable auto-refresh
-  interval: 1h                  # Refresh interval (default 1 hour)
-  timeout: 30s                  # Fetch timeout
-  health_check_timeout: 60s     # New node health check timeout
-  drain_timeout: 30s            # Old instance drain timeout
-  min_available_nodes: 1        # Minimum available nodes required
-```
-
-> ⚠️ **Important: Subscription refresh causes connection interruption**
->
-> During subscription refresh, the program **restarts the sing-box core** to load new node configuration. This means:
->
-> - **All existing connections will be disconnected**
-> - Ongoing downloads, streaming, etc. will be interrupted
-> - Clients need to reconnect
->
-> **Recommendations:**
-> - Set longer refresh intervals (e.g., `1h` or more)
-> - Avoid manual refresh during peak usage
-> - Disable if connection stability is critical (`enabled: false`)
-
-**WebUI and API Support:**
-
-- WebUI shows subscription status (node count, last refresh time, errors)
-- Manual refresh button available
-- API endpoints:
-  - `GET /api/subscription/status` - Get subscription status
-  - `POST /api/subscription/refresh` - Trigger manual refresh
-
-## Ports
-
-| Port | Purpose |
-|------|---------|
-| 2323 | Unified proxy entry (Pool/Hybrid mode) |
-| 9090 | Web dashboard |
-| 24000+ | Per-node ports (Multi-Port/Hybrid mode) |
-
-## Docker Deployment
-
-**Method 1: Host Network Mode (Recommended)**
-
-Use `network_mode: host` for direct host network access:
-
-```yaml
-# docker-compose.yml
 services:
   easy-proxies:
     image: ghcr.io/jasonwong1991/easy_proxies:latest
-    container_name: easy-proxies
-    restart: unless-stopped
     network_mode: host
+    restart: unless-stopped
     volumes:
       - ./config.yaml:/etc/easy-proxies/config.yaml
       - ./nodes.txt:/etc/easy-proxies/nodes.txt
 ```
 
-> **Note**: Config files need write permission for WebUI settings. Run `chmod 666 config.yaml nodes.txt` if you encounter permission errors.
-
-> **Advantage**: Container uses host network directly, all ports exposed automatically. Auto port reassignment works seamlessly.
-
-**Method 2: Port Mapping Mode**
-
-Manually specify port mappings:
+### Option B: port mappings
 
 ```yaml
-# docker-compose.yml
 services:
   easy-proxies:
     image: ghcr.io/jasonwong1991/easy_proxies:latest
-    container_name: easy-proxies
     restart: unless-stopped
     ports:
-      - "2323:2323"       # Pool/Hybrid mode entry
-      - "9090:9090"       # Web dashboard
-      - "24000-24200:24000-24200"  # Multi-Port/Hybrid mode
+      - "2323:2323"
+      - "9090:9090"
+      - "24000-24200:24000-24200"
     volumes:
       - ./config.yaml:/etc/easy-proxies/config.yaml
-      - ./nodes.txt:/etc/easy-proxies/nodes.txt
+      - ./nodes.txt:/etc/easy-proxies/nodes.txt"
 ```
 
-> **Note**: Multi-Port and Hybrid modes require mapping the port range. Map enough ports for your nodes plus some buffer for auto-reassignment.
+## Security Notes
 
-## Building
+- If you bind WebUI to `0.0.0.0`, set `management.password`
+- Public HTTP/SOCKS lists can be hostile/unstable; treat them as untrusted sources
+
+## Build
 
 ```bash
-# Basic build
-go build -o easy-proxies ./cmd/easy_proxies
-
-# Full feature build
 go build -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" -o easy-proxies ./cmd/easy_proxies
 ```
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=jasonwong1991/easy_proxies&type=Date)](https://star-history.com/#jasonwong1991/easy_proxies&Date)
 
 ## License
 

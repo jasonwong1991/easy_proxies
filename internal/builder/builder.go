@@ -141,6 +141,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 				Options: &perOptions,
 			}
 			outbounds = append(outbounds, perPool)
+
 			inboundOptions := &option.HTTPMixedInboundOptions{
 				ListenOptions: option.ListenOptions{
 					Listen:     addr,
@@ -154,7 +155,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 			}
 			inboundTag := fmt.Sprintf("in-%s", tag)
 			inbounds = append(inbounds, option.Inbound{
-				Type:    C.TypeHTTP,
+				Type:    "mixed",
 				Tag:     inboundTag,
 				Options: inboundOptions,
 			})
@@ -202,7 +203,7 @@ func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
 		}}
 	}
 	inbound := option.Inbound{
-		Type:    C.TypeHTTP,
+		Type:    "mixed",
 		Tag:     "http-in",
 		Options: inboundOptions,
 	}
@@ -245,9 +246,119 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 			return option.Outbound{}, err
 		}
 		return option.Outbound{Type: C.TypeVMess, Tag: tag, Options: &opts}, nil
+	case "http", "https":
+		opts, err := buildHTTPProxyOptions(parsed, skipCertVerify)
+		if err != nil {
+			return option.Outbound{}, err
+		}
+		return option.Outbound{Type: C.TypeHTTP, Tag: tag, Options: &opts}, nil
+	case "socks", "socks5", "socks5h", "socks4", "socks4a":
+		opts, err := buildSocksProxyOptions(parsed)
+		if err != nil {
+			return option.Outbound{}, err
+		}
+		return option.Outbound{Type: "socks", Tag: tag, Options: &opts}, nil
 	default:
 		return option.Outbound{}, fmt.Errorf("unsupported scheme %q", parsed.Scheme)
 	}
+}
+
+func buildHTTPProxyOptions(u *url.URL, skipCertVerify bool) (option.HTTPOutboundOptions, error) {
+	defaultPort := 8080
+	if strings.EqualFold(u.Scheme, "https") {
+		defaultPort = 443
+	}
+	server, port, err := hostPort(u, defaultPort)
+	if err != nil {
+		return option.HTTPOutboundOptions{}, err
+	}
+
+	var username, password string
+	if u.User != nil {
+		username = u.User.Username()
+		if p, ok := u.User.Password(); ok {
+			password = p
+		}
+	}
+
+	query := u.Query()
+	if username == "" && query.Get("username") != "" {
+		username = query.Get("username")
+		password = query.Get("password")
+	}
+
+	opts := option.HTTPOutboundOptions{
+		ServerOptions: option.ServerOptions{
+			Server:     server,
+			ServerPort: uint16(port),
+		},
+	}
+
+	if username != "" {
+		opts.Username = username
+		opts.Password = password
+	}
+
+	tlsEnabled := strings.EqualFold(u.Scheme, "https")
+	if v := query.Get("tls"); v != "" {
+		tlsEnabled = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := strings.ToLower(query.Get("security")); v == "tls" {
+		tlsEnabled = true
+	}
+
+	if tlsEnabled {
+		tlsOptions := &option.OutboundTLSOptions{
+			Enabled:    true,
+			ServerName: server,
+			Insecure:   skipCertVerify,
+		}
+
+		if sni := query.Get("sni"); sni != "" {
+			tlsOptions.ServerName = sni
+		}
+		insecure := query.Get("allowInsecure")
+		if insecure == "" {
+			insecure = query.Get("insecure")
+		}
+		if insecure != "" {
+			tlsOptions.Insecure = insecure == "1" || strings.EqualFold(insecure, "true")
+		}
+		if alpn := query.Get("alpn"); alpn != "" {
+			tlsOptions.ALPN = badoption.Listable[string](strings.Split(alpn, ","))
+		}
+
+		opts.OutboundTLSOptionsContainer = option.OutboundTLSOptionsContainer{TLS: tlsOptions}
+	}
+
+	return opts, nil
+}
+
+func buildSocksProxyOptions(u *url.URL) (option.SocksOutboundOptions, error) {
+	server, port, err := hostPort(u, 1080)
+	if err != nil {
+		return option.SocksOutboundOptions{}, err
+	}
+
+	var username, password string
+	if u.User != nil {
+		username = u.User.Username()
+		if p, ok := u.User.Password(); ok {
+			password = p
+		}
+	}
+
+	opts := option.SocksOutboundOptions{
+		ServerOptions: option.ServerOptions{
+			Server:     server,
+			ServerPort: uint16(port),
+		},
+	}
+	if username != "" {
+		opts.Username = username
+		opts.Password = password
+	}
+	return opts, nil
 }
 
 func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOptions, error) {
@@ -788,11 +899,11 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 
 	if showPoolEntry {
 		// Pool mode: single entry point for all nodes
-		var auth string
+		var authStr string
 		if cfg.Listener.Username != "" {
-			auth = fmt.Sprintf("%s:%s@", cfg.Listener.Username, cfg.Listener.Password)
+			authStr = fmt.Sprintf("%s:%s@", cfg.Listener.Username, cfg.Listener.Password)
 		}
-		proxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.Listener.Address, cfg.Listener.Port)
+		proxyURL := fmt.Sprintf("http://%s%s:%d", authStr, cfg.Listener.Address, cfg.Listener.Port)
 		log.Printf("🌐 Pool Entry Point:")
 		log.Printf("   %s", proxyURL)
 		log.Println("")
@@ -810,7 +921,7 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 		log.Printf("🔌 Multi-Port Entry Points (%d nodes):", len(cfg.Nodes))
 		log.Println("")
 		for _, node := range cfg.Nodes {
-			var auth string
+			var authStr string
 			username := node.Username
 			password := node.Password
 			if username == "" {
@@ -818,9 +929,9 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 				password = cfg.MultiPort.Password
 			}
 			if username != "" {
-				auth = fmt.Sprintf("%s:%s@", username, password)
+				authStr = fmt.Sprintf("%s:%s@", username, password)
 			}
-			proxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.MultiPort.Address, node.Port)
+			proxyURL := fmt.Sprintf("http://%s%s:%d", authStr, cfg.MultiPort.Address, node.Port)
 			log.Printf("   [%d] %s", node.Port, node.Name)
 			log.Printf("       %s", proxyURL)
 		}
