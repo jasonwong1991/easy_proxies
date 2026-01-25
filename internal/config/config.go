@@ -27,16 +27,16 @@ type Config struct {
 	Management          ManagementConfig          `yaml:"management"`
 	SubscriptionRefresh SubscriptionRefreshConfig `yaml:"subscription_refresh"`
 	Nodes               []NodeConfig              `yaml:"nodes"`
-	NodesFile           string                    `yaml:"nodes_file"`    // 节点文件路径，每行一个 URI
+	NodesFile           string                    `yaml:"nodes_file"`    // 手工节点文件路径
 	Subscriptions       []string                  `yaml:"subscriptions"` // 订阅链接列表
-	ExternalIP          string                    `yaml:"external_ip"`      // 外部 IP 地址，用于导出时替换 0.0.0.0
+	ExternalIP          string                    `yaml:"external_ip"`   // 外部 IP 地址，用于导出时替换 0.0.0.0
 	LogLevel            string                    `yaml:"log_level"`
 	SkipCertVerify      bool                      `yaml:"skip_cert_verify"` // 全局跳过 SSL 证书验证
 
 	filePath string `yaml:"-"` // 配置文件路径，用于保存
 }
 
-// ListenerConfig defines how the HTTP proxy should listen for clients.
+// ListenerConfig defines how the HTTP/SOCKS proxy should listen for clients.
 type ListenerConfig struct {
 	Address  string `yaml:"address"`
 	Port     uint16 `yaml:"port"`
@@ -82,7 +82,7 @@ type NodeSource string
 
 const (
 	NodeSourceInline       NodeSource = "inline"       // Defined directly in config.yaml nodes array
-	NodeSourceFile         NodeSource = "nodes_file"   // Loaded from external nodes file
+	NodeSourceFile         NodeSource = "nodes_file"   // Loaded from nodes_file
 	NodeSourceSubscription NodeSource = "subscription" // Fetched from subscription URL
 )
 
@@ -99,7 +99,7 @@ type NodeConfig struct {
 // NodeKey returns a unique identifier for the node based on its URI.
 // This is used to preserve port assignments across reloads.
 func (n *NodeConfig) NodeKey() string {
-	return n.URI
+	return strings.TrimSpace(n.URI)
 }
 
 // Load reads YAML config from disk and applies defaults/validation.
@@ -139,6 +139,7 @@ func (c *Config) normalize() error {
 	default:
 		return fmt.Errorf("unsupported mode %q (use 'pool', 'multi-port', or 'hybrid')", c.Mode)
 	}
+
 	if c.Listener.Address == "" {
 		c.Listener.Address = "0.0.0.0"
 	}
@@ -193,21 +194,25 @@ func (c *Config) normalize() error {
 		c.Nodes[idx].Source = NodeSourceInline
 	}
 
-	// Load nodes from file if specified (but NOT if subscriptions exist - subscription takes priority)
-	if c.NodesFile != "" && len(c.Subscriptions) == 0 {
-		fileNodes, err := loadNodesFromFile(c.NodesFile)
+	inlineNodes := make([]NodeConfig, len(c.Nodes))
+	copy(inlineNodes, c.Nodes)
+
+	// Always load nodes from nodes_file if specified (even when subscriptions exist)
+	var fileNodes []NodeConfig
+	if c.NodesFile != "" {
+		nodes, err := loadNodesFromFile(c.NodesFile)
 		if err != nil {
 			return fmt.Errorf("load nodes from file %q: %w", c.NodesFile, err)
 		}
-		for idx := range fileNodes {
-			fileNodes[idx].Source = NodeSourceFile
+		for idx := range nodes {
+			nodes[idx].Source = NodeSourceFile
 		}
-		c.Nodes = append(c.Nodes, fileNodes...)
+		fileNodes = nodes
 	}
 
-	// Load nodes from subscriptions (highest priority - writes to nodes.txt)
+	// Load nodes from subscriptions (append; write to subscription cache file, not nodes_file)
+	var subNodes []NodeConfig
 	if len(c.Subscriptions) > 0 {
-		var subNodes []NodeConfig
 		subTimeout := c.SubscriptionRefresh.Timeout
 		for _, subURL := range c.Subscriptions {
 			nodes, err := loadNodesFromSubscription(subURL, subTimeout)
@@ -218,30 +223,36 @@ func (c *Config) normalize() error {
 			log.Printf("✅ Loaded %d nodes from subscription", len(nodes))
 			subNodes = append(subNodes, nodes...)
 		}
-		// Mark subscription nodes and write to nodes.txt
+
 		for idx := range subNodes {
 			subNodes[idx].Source = NodeSourceSubscription
 		}
+
 		if len(subNodes) > 0 {
-			// Determine nodes.txt path
-			nodesFilePath := c.NodesFile
-			if nodesFilePath == "" {
-				nodesFilePath = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
-				c.NodesFile = nodesFilePath
-			}
-			// Write subscription nodes to nodes.txt
-			if err := writeNodesToFile(nodesFilePath, subNodes); err != nil {
-				log.Printf("⚠️ Failed to write nodes to %q: %v", nodesFilePath, err)
-			} else {
-				log.Printf("✅ Written %d subscription nodes to %s", len(subNodes), nodesFilePath)
+			subPath := c.subscriptionCacheFilePath()
+			if subPath != "" {
+				if err := writeNodesToFile(subPath, subNodes); err != nil {
+					log.Printf("⚠️ Failed to write subscription cache to %q: %v", subPath, err)
+				} else {
+					log.Printf("✅ Written %d subscription nodes to %s", len(subNodes), subPath)
+				}
 			}
 		}
-		c.Nodes = append(c.Nodes, subNodes...)
 	}
 
+	// Merge order: inline -> subscription -> file
+	c.Nodes = nil
+	c.Nodes = append(c.Nodes, inlineNodes...)
+	c.Nodes = append(c.Nodes, subNodes...)
+	c.Nodes = append(c.Nodes, fileNodes...)
+
+	// Dedupe by URI, keep first (subscription wins over file duplicates)
+	c.Nodes = dedupeNodesKeepFirst(c.Nodes)
+
 	if len(c.Nodes) == 0 {
-		return errors.New("config.nodes cannot be empty (configure nodes in config or use nodes_file)")
+		return errors.New("config.nodes cannot be empty (configure nodes/nodes_file/subscriptions)")
 	}
+
 	portCursor := c.MultiPort.BasePort
 	for idx := range c.Nodes {
 		c.Nodes[idx].Name = strings.TrimSpace(c.Nodes[idx].Name)
@@ -254,7 +265,6 @@ func (c *Config) normalize() error {
 		// Auto-extract name from URI fragment (#name) if not provided
 		if c.Nodes[idx].Name == "" {
 			if parsed, err := url.Parse(c.Nodes[idx].URI); err == nil && parsed.Fragment != "" {
-				// URL decode the fragment to handle encoded characters
 				if decoded, err := url.QueryUnescape(parsed.Fragment); err == nil {
 					c.Nodes[idx].Name = decoded
 				} else {
@@ -291,6 +301,7 @@ func (c *Config) normalize() error {
 			}
 		}
 	}
+
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
 	}
@@ -305,7 +316,6 @@ func (c *Config) normalize() error {
 		}
 		for idx := range c.Nodes {
 			if c.Nodes[idx].Port == poolPort {
-				// Find next available port
 				newPort := c.Nodes[idx].Port + 1
 				for usedPorts[newPort] || !isPortAvailable(c.MultiPort.Address, newPort) {
 					newPort++
@@ -324,19 +334,18 @@ func (c *Config) normalize() error {
 }
 
 // BuildPortMap creates a mapping from node URI to port for existing nodes.
-// This is used to preserve port assignments when reloading configuration.
 func (c *Config) BuildPortMap() map[string]uint16 {
 	portMap := make(map[string]uint16)
 	for _, node := range c.Nodes {
-		if node.Port > 0 {
-			portMap[node.NodeKey()] = node.Port
+		key := node.NodeKey()
+		if key != "" && node.Port > 0 {
+			portMap[key] = node.Port
 		}
 	}
 	return portMap
 }
 
-// NormalizeWithPortMap applies defaults and validation, preserving port assignments
-// for nodes that exist in the provided port map.
+// NormalizeWithPortMap applies defaults and validation, preserving port assignments.
 func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	if c.Mode == "" {
 		c.Mode = "pool"
@@ -400,7 +409,6 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 		return errors.New("config.nodes cannot be empty")
 	}
 
-	// Build set of ports already assigned from portMap
 	usedPorts := make(map[uint16]bool)
 	if c.Mode == "hybrid" {
 		usedPorts[c.Listener.Port] = true
@@ -414,7 +422,6 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 			return fmt.Errorf("node %d is missing uri", idx)
 		}
 
-		// Extract name from URI fragment if not provided
 		if c.Nodes[idx].Name == "" {
 			if parsed, err := url.Parse(c.Nodes[idx].URI); err == nil && parsed.Fragment != "" {
 				if decoded, err := url.QueryUnescape(parsed.Fragment); err == nil {
@@ -428,7 +435,6 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 			c.Nodes[idx].Name = fmt.Sprintf("node-%d", idx)
 		}
 
-		// Check if this node has a preserved port from portMap
 		if c.Mode == "multi-port" || c.Mode == "hybrid" {
 			nodeKey := c.Nodes[idx].NodeKey()
 			if existingPort, ok := portMap[nodeKey]; ok && existingPort > 0 {
@@ -443,7 +449,6 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	portCursor := c.MultiPort.BasePort
 	for idx := range c.Nodes {
 		if c.Nodes[idx].Port == 0 && (c.Mode == "multi-port" || c.Mode == "hybrid") {
-			// Find next available port that's not used
 			for usedPorts[portCursor] || !isPortAvailable(c.MultiPort.Address, portCursor) {
 				portCursor++
 				if portCursor > 65535 {
@@ -459,7 +464,6 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 			portCursor++
 		}
 
-		// Apply default credentials
 		if c.Mode == "multi-port" || c.Mode == "hybrid" {
 			if c.Nodes[idx].Username == "" {
 				c.Nodes[idx].Username = c.MultiPort.Username
@@ -491,17 +495,11 @@ func loadNodesFromFile(path string) ([]NodeConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	defaultScheme := defaultPlainSchemeFromName(filepath.Base(path), "")
 	return parseNodesFromContentWithHint(string(data), defaultScheme)
 }
 
 // loadNodesFromSubscription fetches and parses nodes from a subscription URL.
-// Supports multiple formats: base64 encoded, plain text, clash yaml, etc.
-// For plain "host:port" lists, you can add a fragment hint:
-//   - https://example.com/list.txt#socks5
-//   - https://example.com/list.txt#http
-//   - https://example.com/list.txt#https
 func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConfig, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -524,7 +522,6 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	// Set common headers to avoid being blocked
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Accept", "*/*")
 
@@ -543,8 +540,7 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
-	content := string(body)
-	return ParseSubscriptionContentWithHint(content, defaultScheme)
+	return ParseSubscriptionContentWithHint(string(body), defaultScheme)
 }
 
 // ParseSubscriptionContentWithHint parses subscription content in various formats.
@@ -552,26 +548,21 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 func ParseSubscriptionContentWithHint(content string, defaultScheme string) ([]NodeConfig, error) {
 	content = strings.TrimSpace(content)
 
-	// Check if it's base64 encoded (common for v2ray subscriptions)
 	if isBase64(content) {
 		decoded, err := base64.StdEncoding.DecodeString(content)
 		if err != nil {
-			// Try URL-safe base64
 			decoded, err = base64.RawStdEncoding.DecodeString(content)
 			if err != nil {
-				// Not base64, try as plain text
 				return parseNodesFromContentWithHint(content, defaultScheme)
 			}
 		}
 		content = string(decoded)
 	}
 
-	// Check if it's YAML (Clash format)
 	if looksLikeClashYAML(content) {
 		return parseClashYAML(content)
 	}
 
-	// Parse as plain text (one URI per line / or host:port list)
 	return parseNodesFromContentWithHint(content, defaultScheme)
 }
 
@@ -581,7 +572,6 @@ func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
 }
 
 // looksLikeClashYAML detects Clash YAML by finding a "proxies:" key at line start.
-// This avoids false positives when plain text contains "proxies:" inside comments or URLs.
 func looksLikeClashYAML(content string) bool {
 	for _, line := range strings.Split(content, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -593,9 +583,6 @@ func looksLikeClashYAML(content string) bool {
 }
 
 // parseNodesFromContent parses nodes from plain text content.
-// Supports:
-// - one URI per line (vmess://, vless://, http://, socks5://, ...)
-// - plain host:port list (converted to defaultScheme://host:port)
 func parseNodesFromContent(content string) ([]NodeConfig, error) {
 	return parseNodesFromContentWithHint(content, "")
 }
@@ -612,7 +599,6 @@ func parseNodesFromContentWithHint(content string, defaultScheme string) ([]Node
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 
-		// Skip empty lines and comments
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -626,11 +612,8 @@ func parseNodesFromContentWithHint(content string, defaultScheme string) ([]Node
 			continue
 		}
 
-		// Case 1: full URI
 		if isProxyURI(token) {
 			node := NodeConfig{URI: token}
-
-			// If no name in fragment, use host:port to make tags stable
 			if u, err := url.Parse(token); err == nil && u != nil {
 				if u.Fragment != "" {
 					if decoded, err := url.QueryUnescape(u.Fragment); err == nil && decoded != "" {
@@ -642,12 +625,10 @@ func parseNodesFromContentWithHint(content string, defaultScheme string) ([]Node
 					node.Name = u.Host
 				}
 			}
-
 			nodes = append(nodes, node)
 			continue
 		}
 
-		// Case 2: host:port list -> convert to scheme://host:port
 		if hostport, ok := normalizeHostPort(token); ok {
 			nodes = append(nodes, NodeConfig{
 				Name: hostport,
@@ -664,12 +645,9 @@ func normalizeHostPort(token string) (string, bool) {
 	if strings.Contains(token, "://") {
 		return "", false
 	}
-
-	// Reject unbracketed IPv6 (avoid treating it as host:port)
 	if strings.Count(token, ":") > 1 && !strings.HasPrefix(token, "[") {
 		return "", false
 	}
-
 	_, portStr, err := net.SplitHostPort(token)
 	if err != nil {
 		return "", false
@@ -701,6 +679,9 @@ func defaultPlainSchemeFromName(nameHint string, explicitHint string) string {
 	if strings.Contains(lower, "socks5") || strings.Contains(lower, "socks") {
 		return "socks5"
 	}
+	if strings.Contains(lower, "https") {
+		return "https"
+	}
 	if strings.Contains(lower, "http") {
 		return "http"
 	}
@@ -709,21 +690,15 @@ func defaultPlainSchemeFromName(nameHint string, explicitHint string) string {
 
 // isBase64 checks if a string looks like base64 encoded content.
 func isBase64(s string) bool {
-	// Remove whitespace
 	s = strings.TrimSpace(s)
 	if len(s) == 0 {
 		return false
 	}
-
 	s = strings.ReplaceAll(s, "\n", "")
 	s = strings.ReplaceAll(s, "\r", "")
-
-	// Check if it contains proxy URI schemes (then it's not base64)
 	if strings.Contains(s, "://") {
 		return false
 	}
-
-	// Try to decode
 	_, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
 		_, err = base64.RawStdEncoding.DecodeString(s)
@@ -950,7 +925,6 @@ func buildTrojanURI(p clashProxy) string {
 }
 
 func buildShadowsocksURI(p clashProxy) string {
-	// Encode method:password in base64
 	userInfo := base64.StdEncoding.EncodeToString([]byte(p.Cipher + ":" + p.Password))
 	return fmt.Sprintf("ss://%s@%s:%d#%s", userInfo, p.Server, p.Port, url.QueryEscape(p.Name))
 }
@@ -1034,11 +1008,36 @@ func (c *Config) SetFilePath(path string) {
 	}
 }
 
+// subscriptionCacheFilePath returns the derived subscription cache file path.
+// If nodes_file is "nodes.txt", cache will be "nodes.subscription.txt" in the same directory.
+func (c *Config) subscriptionCacheFilePath() string {
+	if c == nil || c.filePath == "" {
+		return ""
+	}
+
+	if c.NodesFile != "" {
+		dir := filepath.Dir(c.NodesFile)
+		base := filepath.Base(c.NodesFile)
+		if strings.HasSuffix(base, ".txt") {
+			base = strings.TrimSuffix(base, ".txt") + ".subscription.txt"
+		} else {
+			base = base + ".subscription"
+		}
+		return filepath.Join(dir, base)
+	}
+
+	return filepath.Join(filepath.Dir(c.filePath), "nodes.subscription.txt")
+}
+
 // writeNodesToFile writes nodes to a file (one URI per line).
 func writeNodesToFile(path string, nodes []NodeConfig) error {
 	var lines []string
 	for _, node := range nodes {
-		lines = append(lines, node.URI)
+		uri := strings.TrimSpace(node.URI)
+		if uri == "" {
+			continue
+		}
+		lines = append(lines, uri)
 	}
 	content := strings.Join(lines, "\n")
 	if len(lines) > 0 {
@@ -1048,9 +1047,9 @@ func writeNodesToFile(path string, nodes []NodeConfig) error {
 }
 
 // SaveNodes persists nodes to their appropriate locations based on source.
-// - subscription/nodes_file nodes → nodes.txt (or configured nodes_file)
-// - inline nodes → config.yaml nodes array
-// Config.yaml structure (subscriptions, nodes_file) is preserved.
+// - NodeSourceFile -> nodes_file
+// - NodeSourceSubscription -> subscription cache file
+// - NodeSourceInline -> config.yaml nodes array
 func (c *Config) SaveNodes() error {
 	if c == nil {
 		return errors.New("config is nil")
@@ -1059,13 +1058,12 @@ func (c *Config) SaveNodes() error {
 		return errors.New("config file path is unknown")
 	}
 
-	// Separate nodes by source
 	var inlineNodes []NodeConfig
 	var fileNodes []NodeConfig
+	var subNodes []NodeConfig
 
 	for _, node := range c.Nodes {
-		// Create a clean copy without runtime fields for saving
-		cleanNode := NodeConfig{
+		clean := NodeConfig{
 			Name:     node.Name,
 			URI:      node.URI,
 			Port:     node.Port,
@@ -1074,16 +1072,17 @@ func (c *Config) SaveNodes() error {
 		}
 		switch node.Source {
 		case NodeSourceInline:
-			inlineNodes = append(inlineNodes, cleanNode)
-		case NodeSourceFile, NodeSourceSubscription:
-			fileNodes = append(fileNodes, cleanNode)
+			inlineNodes = append(inlineNodes, clean)
+		case NodeSourceFile:
+			fileNodes = append(fileNodes, clean)
+		case NodeSourceSubscription:
+			subNodes = append(subNodes, clean)
 		default:
-			// Default to file nodes for unknown source
-			fileNodes = append(fileNodes, cleanNode)
+			fileNodes = append(fileNodes, clean)
 		}
 	}
 
-	// Write file-based nodes to nodes.txt
+	// Write manual nodes_file
 	if len(fileNodes) > 0 || c.NodesFile != "" {
 		nodesFilePath := c.NodesFile
 		if nodesFilePath == "" {
@@ -1091,6 +1090,16 @@ func (c *Config) SaveNodes() error {
 		}
 		if err := writeNodesToFile(nodesFilePath, fileNodes); err != nil {
 			return fmt.Errorf("write nodes file %q: %w", nodesFilePath, err)
+		}
+	}
+
+	// Write subscription cache file (only when there are subscription nodes)
+	if len(subNodes) > 0 {
+		subPath := c.subscriptionCacheFilePath()
+		if subPath != "" {
+			if err := writeNodesToFile(subPath, subNodes); err != nil {
+				return fmt.Errorf("write subscription cache %q: %w", subPath, err)
+			}
 		}
 	}
 
@@ -1122,13 +1131,11 @@ func (c *Config) SaveNodes() error {
 }
 
 // Save is deprecated, use SaveNodes instead.
-// This method is kept for backward compatibility but now delegates to SaveNodes.
 func (c *Config) Save() error {
 	return c.SaveNodes()
 }
 
-// SaveSettings persists only config settings (external_ip, probe_target, skip_cert_verify)
-// without touching nodes.txt. Use this for settings API updates.
+// SaveSettings persists only config settings (external_ip, probe_target, skip_cert_verify).
 func (c *Config) SaveSettings() error {
 	if c == nil {
 		return errors.New("config is nil")
@@ -1169,4 +1176,21 @@ func isPortAvailable(address string, port uint16) bool {
 	}
 	_ = ln.Close()
 	return true
+}
+
+func dedupeNodesKeepFirst(nodes []NodeConfig) []NodeConfig {
+	seen := make(map[string]struct{}, len(nodes))
+	out := make([]NodeConfig, 0, len(nodes))
+	for _, n := range nodes {
+		key := strings.TrimSpace(n.URI)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, n)
+	}
+	return out
 }

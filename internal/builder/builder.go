@@ -334,10 +334,10 @@ func buildHTTPProxyOptions(u *url.URL, skipCertVerify bool) (option.HTTPOutbound
 	return opts, nil
 }
 
-func buildSocksProxyOptions(u *url.URL) (option.SocksOutboundOptions, error) {
+func buildSocksProxyOptions(u *url.URL) (option.SOCKSOutboundOptions, error) {
 	server, port, err := hostPort(u, 1080)
 	if err != nil {
-		return option.SocksOutboundOptions{}, err
+		return option.SOCKSOutboundOptions{}, err
 	}
 
 	var username, password string
@@ -348,7 +348,7 @@ func buildSocksProxyOptions(u *url.URL) (option.SocksOutboundOptions, error) {
 		}
 	}
 
-	opts := option.SocksOutboundOptions{
+	opts := option.SOCKSOutboundOptions{
 		ServerOptions: option.ServerOptions{
 			Server:     server,
 			ServerPort: uint16(port),

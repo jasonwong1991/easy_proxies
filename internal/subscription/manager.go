@@ -49,9 +49,9 @@ type Manager struct {
 	refreshMu     sync.Mutex // prevents concurrent refreshes
 	manualRefresh chan struct{}
 
-	// Track nodes.txt content hash to detect modifications
-	lastSubHash      string    // Hash of nodes.txt content after last subscription refresh
-	lastNodesModTime time.Time // Last known modification time of nodes.txt
+	// Track subscription cache file content hash to detect modifications
+	lastSubHash      string
+	lastNodesModTime time.Time
 }
 
 // New creates a SubscriptionManager.
@@ -102,10 +102,8 @@ func (m *Manager) RefreshNow() error {
 	select {
 	case m.manualRefresh <- struct{}{}:
 	default:
-		// Already a refresh pending
 	}
 
-	// Wait for refresh to complete or timeout
 	timeout := m.baseCfg.SubscriptionRefresh.Timeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -114,7 +112,6 @@ func (m *Manager) RefreshNow() error {
 	ctx, cancel := context.WithTimeout(m.ctx, timeout+m.baseCfg.SubscriptionRefresh.HealthCheckTimeout)
 	defer cancel()
 
-	// Poll status until refresh completes
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -141,17 +138,14 @@ func (m *Manager) Status() monitor.SubscriptionStatus {
 	status := m.status
 	m.mu.RUnlock()
 
-	// Check if nodes have been modified since last refresh
 	status.NodesModified = m.CheckNodesModified()
 	return status
 }
 
-// refreshLoop runs the periodic refresh.
 func (m *Manager) refreshLoop(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// Update next refresh time
 	m.mu.Lock()
 	m.status.NextRefresh = time.Now().Add(interval)
 	m.mu.Unlock()
@@ -167,7 +161,6 @@ func (m *Manager) refreshLoop(interval time.Duration) {
 			m.mu.Unlock()
 		case <-m.manualRefresh:
 			m.doRefresh()
-			// Reset ticker after manual refresh
 			ticker.Reset(interval)
 			m.mu.Lock()
 			m.status.NextRefresh = time.Now().Add(interval)
@@ -178,7 +171,6 @@ func (m *Manager) refreshLoop(interval time.Duration) {
 
 // doRefresh performs a single refresh operation.
 func (m *Manager) doRefresh() {
-	// Prevent concurrent refreshes
 	if !m.refreshMu.TryLock() {
 		m.logger.Warnf("refresh already in progress, skipping")
 		return
@@ -198,8 +190,7 @@ func (m *Manager) doRefresh() {
 
 	m.logger.Infof("starting subscription refresh")
 
-	// Fetch nodes from all subscriptions
-	nodes, err := m.fetchAllSubscriptions()
+	subNodes, err := m.fetchAllSubscriptions()
 	if err != nil {
 		m.logger.Errorf("fetch subscriptions failed: %v", err)
 		m.mu.Lock()
@@ -208,8 +199,7 @@ func (m *Manager) doRefresh() {
 		m.mu.Unlock()
 		return
 	}
-
-	if len(nodes) == 0 {
+	if len(subNodes) == 0 {
 		m.logger.Warnf("no nodes fetched from subscriptions")
 		m.mu.Lock()
 		m.status.LastError = "no nodes fetched"
@@ -218,39 +208,38 @@ func (m *Manager) doRefresh() {
 		return
 	}
 
-	m.logger.Infof("fetched %d nodes from subscriptions", len(nodes))
-
-	// Write subscription nodes to nodes.txt
-	nodesFilePath := m.getNodesFilePath()
-	if err := m.writeNodesToFile(nodesFilePath, nodes); err != nil {
-		m.logger.Errorf("failed to write nodes.txt: %v", err)
-		m.mu.Lock()
-		m.status.LastError = fmt.Sprintf("write nodes.txt: %v", err)
-		m.status.LastRefresh = time.Now()
-		m.mu.Unlock()
-		return
+	for i := range subNodes {
+		subNodes[i].Source = config.NodeSourceSubscription
 	}
-	m.logger.Infof("written %d nodes to %s", len(nodes), nodesFilePath)
 
-	// Update hash and mod time after writing
-	newHash := m.computeNodesHash(nodes)
+	cachePath := m.getSubscriptionCacheFilePath()
+	if cachePath != "" {
+		if err := m.writeNodesToFile(cachePath, subNodes); err != nil {
+			m.logger.Errorf("failed to write subscription cache: %v", err)
+			m.mu.Lock()
+			m.status.LastError = fmt.Sprintf("write subscription cache: %v", err)
+			m.status.LastRefresh = time.Now()
+			m.mu.Unlock()
+			return
+		}
+	}
+
+	newHash := m.computeNodesHash(subNodes)
 	m.mu.Lock()
 	m.lastSubHash = newHash
-	if info, err := os.Stat(nodesFilePath); err == nil {
-		m.lastNodesModTime = info.ModTime()
-	} else {
-		m.lastNodesModTime = time.Now()
+	if cachePath != "" {
+		if info, err := os.Stat(cachePath); err == nil {
+			m.lastNodesModTime = info.ModTime()
+		} else {
+			m.lastNodesModTime = time.Now()
+		}
 	}
 	m.status.NodesModified = false
 	m.mu.Unlock()
 
-	// Get current port mapping to preserve existing node ports
 	portMap := m.boxMgr.CurrentPortMap()
+	newCfg := m.createNewConfig(subNodes)
 
-	// Create new config with updated nodes
-	newCfg := m.createNewConfig(nodes)
-
-	// Trigger BoxManager reload with port preservation
 	if err := m.boxMgr.ReloadWithPortMap(newCfg, portMap); err != nil {
 		m.logger.Errorf("reload failed: %v", err)
 		m.mu.Lock()
@@ -262,26 +251,53 @@ func (m *Manager) doRefresh() {
 
 	m.mu.Lock()
 	m.status.LastRefresh = time.Now()
-	m.status.NodeCount = len(nodes)
+	m.status.NodeCount = len(subNodes)
 	m.status.LastError = ""
 	m.mu.Unlock()
 
-	m.logger.Infof("subscription refresh completed, %d nodes active", len(nodes))
+	m.logger.Infof("subscription refresh completed, %d subscription nodes active", len(subNodes))
 }
 
-// getNodesFilePath returns the path to nodes.txt.
-func (m *Manager) getNodesFilePath() string {
-	if m.baseCfg.NodesFile != "" {
-		return m.baseCfg.NodesFile
+func (m *Manager) getManualNodesFilePath() string {
+	p := strings.TrimSpace(m.baseCfg.NodesFile)
+	if p == "" {
+		return ""
 	}
-	return filepath.Join(filepath.Dir(m.baseCfg.FilePath()), "nodes.txt")
+	return p
 }
 
-// writeNodesToFile writes nodes to a file (one URI per line).
+func (m *Manager) getSubscriptionCacheFilePath() string {
+	if m.baseCfg == nil {
+		return ""
+	}
+
+	nodesFile := strings.TrimSpace(m.baseCfg.NodesFile)
+	if nodesFile != "" {
+		dir := filepath.Dir(nodesFile)
+		base := filepath.Base(nodesFile)
+		if strings.HasSuffix(base, ".txt") {
+			base = strings.TrimSuffix(base, ".txt") + ".subscription.txt"
+		} else {
+			base = base + ".subscription"
+		}
+		return filepath.Join(dir, base)
+	}
+
+	cfgPath := strings.TrimSpace(m.baseCfg.FilePath())
+	if cfgPath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(cfgPath), "nodes.subscription.txt")
+}
+
 func (m *Manager) writeNodesToFile(path string, nodes []config.NodeConfig) error {
 	var lines []string
 	for _, node := range nodes {
-		lines = append(lines, node.URI)
+		uri := strings.TrimSpace(node.URI)
+		if uri == "" {
+			continue
+		}
+		lines = append(lines, uri)
 	}
 	content := strings.Join(lines, "\n")
 	if len(lines) > 0 {
@@ -290,19 +306,17 @@ func (m *Manager) writeNodesToFile(path string, nodes []config.NodeConfig) error
 	return os.WriteFile(path, []byte(content), 0o644)
 }
 
-// computeNodesHash computes a hash of node URIs for change detection.
 func (m *Manager) computeNodesHash(nodes []config.NodeConfig) string {
 	var uris []string
 	for _, node := range nodes {
-		uris = append(uris, node.URI)
+		uris = append(uris, strings.TrimSpace(node.URI))
 	}
 	content := strings.Join(uris, "\n")
 	hash := sha256.Sum256([]byte(content))
 	return hex.EncodeToString(hash[:])
 }
 
-// CheckNodesModified checks if nodes.txt has been modified since last refresh.
-// Uses file modification time as a fast path to avoid unnecessary file reads.
+// CheckNodesModified checks whether the subscription cache file was modified since last refresh.
 func (m *Manager) CheckNodesModified() bool {
 	m.mu.RLock()
 	lastHash := m.lastSubHash
@@ -310,25 +324,26 @@ func (m *Manager) CheckNodesModified() bool {
 	m.mu.RUnlock()
 
 	if lastHash == "" {
-		return false // No previous refresh, can't determine modification
+		return false
 	}
 
-	nodesFilePath := m.getNodesFilePath()
+	cachePath := m.getSubscriptionCacheFilePath()
+	if cachePath == "" {
+		return false
+	}
 
-	// Fast path: check modification time first
-	info, err := os.Stat(nodesFilePath)
+	info, err := os.Stat(cachePath)
 	if err != nil {
-		return false // File doesn't exist or can't stat
+		return false
 	}
 	modTime := info.ModTime()
 	if !modTime.After(lastMod) {
-		return false // File hasn't been modified
+		return false
 	}
 
-	// Slow path: file was modified, compute hash
-	data, err := os.ReadFile(nodesFilePath)
+	data, err := os.ReadFile(cachePath)
 	if err != nil {
-		return false // File doesn't exist or can't read
+		return false
 	}
 
 	nodes, err := config.ParseSubscriptionContent(string(data))
@@ -339,7 +354,6 @@ func (m *Manager) CheckNodesModified() bool {
 	currentHash := m.computeNodesHash(nodes)
 	changed := currentHash != lastHash
 
-	// Update cached mod time
 	m.mu.Lock()
 	m.lastNodesModTime = modTime
 	m.mu.Unlock()
@@ -347,14 +361,12 @@ func (m *Manager) CheckNodesModified() bool {
 	return changed
 }
 
-// MarkNodesModified updates the modification status.
 func (m *Manager) MarkNodesModified() {
 	m.mu.Lock()
 	m.status.NodesModified = true
 	m.mu.Unlock()
 }
 
-// fetchAllSubscriptions fetches nodes from all configured subscription URLs.
 func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
 	var allNodes []config.NodeConfig
 	var lastErr error
@@ -398,10 +410,11 @@ func splitSubscriptionURL(raw string) (requestURL string, defaultScheme string) 
 	case "socks":
 		defaultScheme = "socks5"
 	default:
-		// If no explicit fragment hint, try simple heuristics based on URL path
 		pathLower := strings.ToLower(u.Path)
 		if strings.Contains(pathLower, "socks5") || strings.Contains(pathLower, "socks") {
 			defaultScheme = "socks5"
+		} else if strings.Contains(pathLower, "https") {
+			defaultScheme = "https"
 		} else if strings.Contains(pathLower, "http") {
 			defaultScheme = "http"
 		}
@@ -412,7 +425,6 @@ func splitSubscriptionURL(raw string) (requestURL string, defaultScheme string) 
 	return requestURL, defaultScheme
 }
 
-// fetchSubscription fetches and parses a single subscription URL.
 func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]config.NodeConfig, error) {
 	ctx, cancel := context.WithTimeout(m.ctx, timeout)
 	defer cancel()
@@ -445,33 +457,115 @@ func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]con
 	return config.ParseSubscriptionContentWithHint(string(body), defaultScheme)
 }
 
-// createNewConfig creates a new config with updated nodes while preserving other settings.
-func (m *Manager) createNewConfig(nodes []config.NodeConfig) *config.Config {
-	// Deep copy base config
+func (m *Manager) loadManualFileNodes() []config.NodeConfig {
+	path := m.getManualNodesFilePath()
+	if path == "" {
+		return nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		m.logger.Warnf("failed to read nodes_file %q: %v", path, err)
+		return nil
+	}
+
+	defaultScheme := "http"
+	baseLower := strings.ToLower(filepath.Base(path))
+	if strings.Contains(baseLower, "socks5") || strings.Contains(baseLower, "socks") {
+		defaultScheme = "socks5"
+	} else if strings.Contains(baseLower, "https") {
+		defaultScheme = "https"
+	} else if strings.Contains(baseLower, "http") {
+		defaultScheme = "http"
+	}
+
+	nodes, err := config.ParseSubscriptionContentWithHint(string(data), defaultScheme)
+	if err != nil {
+		m.logger.Warnf("failed to parse nodes_file %q: %v", path, err)
+		return nil
+	}
+	for i := range nodes {
+		nodes[i].Source = config.NodeSourceFile
+	}
+	return nodes
+}
+
+func (m *Manager) inlineNodes() []config.NodeConfig {
+	if m.baseCfg == nil {
+		return nil
+	}
+	var nodes []config.NodeConfig
+	for _, n := range m.baseCfg.Nodes {
+		if n.Source == config.NodeSourceInline {
+			nodes = append(nodes, n)
+		}
+	}
+	return nodes
+}
+
+// createNewConfig merges inline + subscription + file nodes.
+func (m *Manager) createNewConfig(subNodes []config.NodeConfig) *config.Config {
 	newCfg := *m.baseCfg
 
-	// Process node names (ports are assigned later by NormalizeWithPortMap)
-	for i := range nodes {
-		nodes[i].Name = strings.TrimSpace(nodes[i].Name)
-		nodes[i].URI = strings.TrimSpace(nodes[i].URI)
+	inline := m.inlineNodes()
+	fileNodes := m.loadManualFileNodes()
 
-		// Extract name from URI fragment if not provided
-		if nodes[i].Name == "" {
-			if parsed, err := url.Parse(nodes[i].URI); err == nil && parsed.Fragment != "" {
+	merged := mergeNodesKeepFirst(append(append([]config.NodeConfig{}, inline...), subNodes...), fileNodes...)
+
+	// Ensure names (extract from fragment if needed)
+	for i := range merged {
+		merged[i].Name = strings.TrimSpace(merged[i].Name)
+		merged[i].URI = strings.TrimSpace(merged[i].URI)
+
+		if merged[i].Name == "" {
+			if parsed, err := url.Parse(merged[i].URI); err == nil && parsed.Fragment != "" {
 				if decoded, err := url.QueryUnescape(parsed.Fragment); err == nil {
-					nodes[i].Name = decoded
+					merged[i].Name = decoded
 				} else {
-					nodes[i].Name = parsed.Fragment
+					merged[i].Name = parsed.Fragment
 				}
 			}
 		}
-		if nodes[i].Name == "" {
-			nodes[i].Name = fmt.Sprintf("node-%d", i)
+		if merged[i].Name == "" {
+			merged[i].Name = fmt.Sprintf("node-%d", i)
 		}
 	}
 
-	newCfg.Nodes = nodes
+	newCfg.Nodes = merged
 	return &newCfg
+}
+
+func mergeNodesKeepFirst(nodes []config.NodeConfig, extra ...[]config.NodeConfig) []config.NodeConfig {
+	seen := make(map[string]struct{}, len(nodes))
+	out := make([]config.NodeConfig, 0, len(nodes))
+
+	for _, n := range nodes {
+		key := strings.TrimSpace(n.URI)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, n)
+	}
+
+	for _, list := range extra {
+		for _, n := range list {
+			key := strings.TrimSpace(n.URI)
+			if key == "" {
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, n)
+		}
+	}
+
+	return out
 }
 
 type defaultLogger struct{}

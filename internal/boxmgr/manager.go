@@ -107,7 +107,6 @@ func (m *Manager) Start(ctx context.Context) error {
 	cfg := m.cfg
 	m.mu.Unlock()
 
-	// Try to start, with automatic port conflict resolution
 	var instance *box.Box
 	maxRetries := 10
 	for retry := 0; retry < maxRetries; retry++ {
@@ -118,24 +117,22 @@ func (m *Manager) Start(ctx context.Context) error {
 		}
 		if err = instance.Start(); err != nil {
 			_ = instance.Close()
-			// Check if it's a port conflict error
 			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
 				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
 				if reassigned := reassignConflictingPort(cfg, conflictPort); reassigned {
-					pool.ResetSharedStateStore() // Reset shared state for rebuild
+					pool.ResetSharedStateStore()
 					continue
 				}
 			}
 			return fmt.Errorf("start sing-box: %w", err)
 		}
-		break // Success
+		break
 	}
 
 	m.mu.Lock()
 	m.currentBox = instance
 	m.mu.Unlock()
 
-	// Start periodic health check after nodes are registered
 	m.mu.Lock()
 	if m.monitorMgr != nil && !m.healthCheckStarted {
 		m.monitorMgr.StartPeriodicHealthCheck(periodicHealthInterval, periodicHealthTimeout)
@@ -143,7 +140,6 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 
-	// Wait for initial health check if min nodes configured
 	if cfg.SubscriptionRefresh.MinAvailableNodes > 0 {
 		timeout := cfg.SubscriptionRefresh.HealthCheckTimeout
 		if timeout <= 0 {
@@ -151,7 +147,6 @@ func (m *Manager) Start(ctx context.Context) error {
 		}
 		if err := m.waitForHealthCheck(timeout); err != nil {
 			m.logger.Warnf("initial health check warning: %v", err)
-			// Don't fail startup, just warn
 		}
 	}
 
@@ -174,7 +169,7 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	ctx := m.baseCtx
 	oldBox := m.currentBox
 	oldCfg := m.cfg
-	m.currentBox = nil // Mark as reloading
+	m.currentBox = nil
 	m.mu.Unlock()
 
 	if ctx == nil {
@@ -183,21 +178,16 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	m.logger.Infof("reloading with %d nodes", len(newCfg.Nodes))
 
-	// For multi-port mode, we must close old instance first to release ports
-	// This causes a brief interruption but avoids port conflicts
 	if oldBox != nil {
 		m.logger.Infof("stopping old instance to release ports...")
 		if err := oldBox.Close(); err != nil {
 			m.logger.Warnf("error closing old instance: %v", err)
 		}
-		// Give OS time to release ports
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Reset shared state store to ensure clean state for new config
 	pool.ResetSharedStateStore()
 
-	// Create and start new box instance with automatic port conflict resolution
 	var instance *box.Box
 	maxRetries := 10
 	for retry := 0; retry < maxRetries; retry++ {
@@ -209,7 +199,6 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		}
 		if err = instance.Start(); err != nil {
 			_ = instance.Close()
-			// Check if it's a port conflict error
 			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
 				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
 				if reassigned := reassignConflictingPort(newCfg, conflictPort); reassigned {
@@ -220,7 +209,7 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 			m.rollbackToOldConfig(ctx, oldCfg)
 			return fmt.Errorf("start new box: %w", err)
 		}
-		break // Success
+		break
 	}
 
 	m.applyConfigSettings(newCfg)
@@ -424,11 +413,9 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 			serverToStart = monitor.NewServer(m.monitorCfg, monitorMgr, log.Default())
 			m.monitorServer = serverToStart
 		}
-		// Set NodeManager for config CRUD endpoints
 		if m.monitorServer != nil {
 			m.monitorServer.SetNodeManager(m)
 		}
-		// Note: StartPeriodicHealthCheck is called after nodes are registered in Start()
 	}
 	m.mu.Unlock()
 
@@ -519,11 +506,10 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 		return config.NodeConfig{}, err
 	}
 
-	// Determine source: if subscriptions exist, new nodes go to nodes.txt (subscription source)
-	// Otherwise, if nodes_file exists, use file source; else inline
-	if len(m.cfg.Subscriptions) > 0 {
-		normalized.Source = config.NodeSourceSubscription
-	} else if m.cfg.NodesFile != "" {
+	// Source selection:
+	// - If nodes_file is configured, always write new nodes to nodes_file (manual nodes).
+	// - Otherwise, write into config.yaml nodes array (inline nodes).
+	if m.cfg.NodesFile != "" {
 		normalized.Source = config.NodeSourceFile
 	} else {
 		normalized.Source = config.NodeSourceInline
@@ -563,7 +549,6 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 		return config.NodeConfig{}, err
 	}
 
-	// Preserve the original source
 	normalized.Source = m.cfg.Nodes[idx].Source
 
 	prev := m.cfg.Nodes[idx]
@@ -615,7 +600,7 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 
 	m.mu.RLock()
 	cfgCopy := m.copyConfigLocked()
-	portMap := m.cfg.BuildPortMap() // Preserve existing port assignments
+	portMap := m.cfg.BuildPortMap()
 	m.mu.RUnlock()
 
 	if cfgCopy == nil {
@@ -630,7 +615,6 @@ func (m *Manager) ReloadWithPortMap(newCfg *config.Config, portMap map[string]ui
 		return errors.New("new config is nil")
 	}
 
-	// Apply port mapping to preserve existing node ports
 	if portMap != nil && len(portMap) > 0 {
 		if err := newCfg.NormalizeWithPortMap(portMap); err != nil {
 			return fmt.Errorf("normalize config with port map: %w", err)
@@ -652,10 +636,8 @@ func (m *Manager) CurrentPortMap() map[string]uint16 {
 
 // --- Helper functions ---
 
-// portBindErrorRegex matches "listen tcp4 0.0.0.0:24282: bind: address already in use"
 var portBindErrorRegex = regexp.MustCompile(`listen tcp[46]? [^:]+:(\d+): bind: address already in use`)
 
-// extractPortFromBindError extracts the port number from a bind error message.
 func extractPortFromBindError(err error) uint16 {
 	if err == nil {
 		return 0
@@ -672,7 +654,6 @@ func extractPortFromBindError(err error) uint16 {
 	return 0
 }
 
-// isPortAvailable checks if a port is available for binding.
 func isPortAvailable(address string, port uint16) bool {
 	addr := fmt.Sprintf("%s:%d", address, port)
 	ln, err := net.Listen("tcp", addr)
@@ -683,9 +664,7 @@ func isPortAvailable(address string, port uint16) bool {
 	return true
 }
 
-// reassignConflictingPort finds the node using the conflicting port and assigns a new port.
 func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {
-	// Build set of used ports
 	usedPorts := make(map[uint16]bool)
 	if cfg.Mode == "hybrid" {
 		usedPorts[cfg.Listener.Port] = true
@@ -694,10 +673,8 @@ func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {
 		usedPorts[node.Port] = true
 	}
 
-	// Find and reassign the conflicting node
 	for idx := range cfg.Nodes {
 		if cfg.Nodes[idx].Port == conflictPort {
-			// Find next available port
 			newPort := conflictPort + 1
 			address := cfg.MultiPort.Address
 			if address == "" {
@@ -720,7 +697,7 @@ func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {
 
 func cloneNodes(nodes []config.NodeConfig) []config.NodeConfig {
 	if len(nodes) == 0 {
-		return []config.NodeConfig{} // Return empty slice, not nil, for proper JSON serialization
+		return []config.NodeConfig{}
 	}
 	out := make([]config.NodeConfig, len(nodes))
 	copy(out, nodes)
@@ -793,31 +770,26 @@ func (m *Manager) prepareNodeLocked(node config.NodeConfig, currentName string) 
 		return config.NodeConfig{}, fmt.Errorf("%w: URI 不能为空", monitor.ErrInvalidNode)
 	}
 
-	// Extract name from URI fragment (#name) if not provided
 	if node.Name == "" {
 		if currentName != "" {
 			node.Name = currentName
 		} else if idx := strings.LastIndex(node.URI, "#"); idx != -1 && idx < len(node.URI)-1 {
-			// Extract and URL-decode the fragment
 			fragment := node.URI[idx+1:]
 			if decoded, err := url.QueryUnescape(fragment); err == nil && decoded != "" {
 				node.Name = decoded
 			}
 		}
-		// Fallback to auto-generated name
 		if node.Name == "" {
 			node.Name = fmt.Sprintf("node-%d", len(m.cfg.Nodes)+1)
 		}
 	}
 
-	// Check for name conflict (excluding current node when updating)
 	if idx := m.nodeIndexLocked(node.Name); idx != -1 {
 		if currentName == "" || m.cfg.Nodes[idx].Name != currentName {
 			return config.NodeConfig{}, fmt.Errorf("%w: 节点 %s 已存在", monitor.ErrNodeConflict, node.Name)
 		}
 	}
 
-	// Handle multi-port mode specifics
 	if m.cfg.Mode == "multi-port" {
 		if node.Port == 0 {
 			node.Port = m.nextAvailablePortLocked()
