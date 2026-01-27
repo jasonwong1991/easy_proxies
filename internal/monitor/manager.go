@@ -74,6 +74,7 @@ type EntryHandle struct {
 }
 
 type entry struct {
+	generation 		 uint64
 	info             NodeInfo
 	failure          int
 	success          int64
@@ -97,11 +98,19 @@ type Manager struct {
 	cfg        Config
 	probeDst   M.Socksaddr
 	probeReady bool
+
+	// probeTLS indicates whether to do TLS handshake before HTTP probing.
+	probeTLS        bool
+	probeServerName string // SNI
+	probeHostHeader string // Host header (may include :port, IPv6 brackets)
+
 	mu         sync.RWMutex
 	nodes      map[string]*entry
-	ctx        context.Context
-	cancel     context.CancelFunc
-	logger     Logger
+	generation uint64
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	logger Logger
 }
 
 // Logger interface for logging
@@ -119,33 +128,18 @@ func NewManager(cfg Config) (*Manager, error) {
 		ctx:    ctx,
 		cancel: cancel,
 	}
-	if cfg.ProbeTarget != "" {
-		target := cfg.ProbeTarget
-		// Strip URL scheme if present (e.g., "https://www.google.com:443" -> "www.google.com:443")
-		if strings.HasPrefix(target, "https://") {
-			target = strings.TrimPrefix(target, "https://")
-		} else if strings.HasPrefix(target, "http://") {
-			target = strings.TrimPrefix(target, "http://")
-		}
-		// Remove trailing path if present
-		if idx := strings.Index(target, "/"); idx != -1 {
-			target = target[:idx]
-		}
-		host, port, err := net.SplitHostPort(target)
-		if err != nil {
-			// If no port specified, use default based on original scheme
-			if strings.HasPrefix(cfg.ProbeTarget, "https://") {
-				host = target
-				port = "443"
-			} else {
-				host = target
-				port = "80"
-			}
-		}
-		parsed := M.ParseSocksaddrHostPort(host, parsePort(port))
-		m.probeDst = parsed
-		m.probeReady = true
+
+	dst, hostHeader, useTLS, serverName, ready, err := parseProbeTarget(cfg.ProbeTarget)
+	if err != nil {
+		cancel()
+		return nil, err
 	}
+	m.probeDst = dst
+	m.probeReady = ready
+	m.probeTLS = useTLS
+	m.probeServerName = serverName
+	m.probeHostHeader = hostHeader
+
 	return m, nil
 }
 
@@ -158,16 +152,16 @@ func (m *Manager) SetLogger(logger Logger) {
 // interval: how often to check (e.g., 30 * time.Second)
 // timeout: timeout for each probe (e.g., 10 * time.Second)
 func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
-	if !m.probeReady {
-		if m.logger != nil {
-			m.logger.Warn("probe target not configured, periodic health check disabled")
+	if m.logger != nil {
+		if _, ok := m.DestinationForProbe(); !ok {
+			m.logger.Warn("probe target not configured, periodic health check will wait until it is set")
 		}
-		return
+		m.logger.Info("periodic health check started, interval: ", interval)
 	}
 
 	go func() {
-		// 启动后立即进行一次检查
-		m.probeAllNodes(timeout)
+		// 启动后立即进行一次检查（如果 probe_target 可用）
+		m.probeAllNodesIfReady(timeout)
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -177,14 +171,10 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 			case <-m.ctx.Done():
 				return
 			case <-ticker.C:
-				m.probeAllNodes(timeout)
+				m.probeAllNodesIfReady(timeout)
 			}
 		}
 	}()
-
-	if m.logger != nil {
-		m.logger.Info("periodic health check started, interval: ", interval)
-	}
 }
 
 // probeAllNodes checks all registered nodes concurrently.
@@ -204,10 +194,18 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 		m.logger.Info("starting health check for ", len(entries), " nodes")
 	}
 
-	workerLimit := runtime.NumCPU() * 2
-	if workerLimit < 8 {
-		workerLimit = 8
+	// 为大节点量场景提高并发，但避免过高造成抖动
+	workerLimit := runtime.NumCPU() * 4
+	if workerLimit < 16 {
+		workerLimit = 16
 	}
+	if workerLimit > 32 {
+		workerLimit = 32
+	}
+	if workerLimit > len(entries) {
+		workerLimit = len(entries)
+	}
+
 	sem := make(chan struct{}, workerLimit)
 	var wg sync.WaitGroup
 	var availableCount atomic.Int32
@@ -276,29 +274,225 @@ func parsePort(value string) uint16 {
 	return uint16(p)
 }
 
+func parsePortStrict(value string) (uint16, error) {
+	p, err := strconv.Atoi(value)
+	if err != nil || p <= 0 || p > 65535 {
+		return 0, fmt.Errorf("invalid port %q", value)
+	}
+	return uint16(p), nil
+}
+
+func parseProbeTarget(raw string) (dst M.Socksaddr, hostHeader string, useTLS bool, serverName string, ready bool, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return M.Socksaddr{}, "", false, "", false, nil
+	}
+
+	target := raw
+	lower := strings.ToLower(target)
+
+	defaultPort := uint16(80)
+	hasScheme := false
+
+	if strings.HasPrefix(lower, "https://") {
+		hasScheme = true
+		useTLS = true
+		defaultPort = 443
+		target = target[len("https://"):]
+	} else if strings.HasPrefix(lower, "http://") {
+		hasScheme = true
+		useTLS = false
+		defaultPort = 80
+		target = target[len("http://"):]
+	}
+
+	// Strip trailing path if present.
+	if idx := strings.Index(target, "/"); idx != -1 {
+		target = target[:idx]
+	}
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return M.Socksaddr{}, "", false, "", false, fmt.Errorf("invalid probe_target %q", raw)
+	}
+
+	host := ""
+	port := defaultPort
+
+	if strings.HasPrefix(target, "[") {
+		// Bracketed IPv6.
+		if strings.Contains(target, "]:") {
+			h, p, e := net.SplitHostPort(target)
+			if e != nil {
+				return M.Socksaddr{}, "", false, "", false, fmt.Errorf("invalid probe_target %q: %w", raw, e)
+			}
+			pp, e := parsePortStrict(p)
+			if e != nil {
+				return M.Socksaddr{}, "", false, "", false, e
+			}
+			host = h
+			port = pp
+		} else if strings.HasSuffix(target, "]") {
+			host = strings.TrimSuffix(strings.TrimPrefix(target, "["), "]")
+			port = defaultPort
+		} else {
+			return M.Socksaddr{}, "", false, "", false, fmt.Errorf("invalid probe_target %q", raw)
+		}
+	} else if strings.Count(target, ":") == 1 {
+		idx := strings.LastIndex(target, ":")
+		h := strings.TrimSpace(target[:idx])
+		p := strings.TrimSpace(target[idx+1:])
+		if h == "" || p == "" {
+			return M.Socksaddr{}, "", false, "", false, fmt.Errorf("invalid probe_target %q", raw)
+		}
+		pp, e := parsePortStrict(p)
+		if e != nil {
+			return M.Socksaddr{}, "", false, "", false, e
+		}
+		host = h
+		port = pp
+	} else {
+		host = target
+		port = defaultPort
+	}
+
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return M.Socksaddr{}, "", false, "", false, fmt.Errorf("invalid probe_target %q", raw)
+	}
+
+	// Heuristic: no scheme + port 443 => treat as TLS.
+	if !hasScheme && port == 443 {
+		useTLS = true
+	}
+
+	serverName = host
+
+	// Host header uses URI authority form; IPv6 must be bracketed.
+	hostForHeader := host
+	if strings.Contains(host, ":") {
+		hostForHeader = "[" + host + "]"
+	}
+
+	// Include port in Host header only if non-default for the chosen scheme.
+	if (useTLS && port == 443) || (!useTLS && port == 80) {
+		hostHeader = hostForHeader
+	} else {
+		hostHeader = fmt.Sprintf("%s:%d", hostForHeader, port)
+	}
+
+	dst = M.ParseSocksaddrHostPort(host, port)
+	return dst, hostHeader, useTLS, serverName, true, nil
+}
+
+// UpdateProbeTarget updates probe destination dynamically.
+// After this, future probes / periodic health checks will use the new target.
+func (m *Manager) UpdateProbeTarget(target string) error {
+	dst, hostHeader, useTLS, serverName, ready, err := parseProbeTarget(target)
+	if err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	m.cfg.ProbeTarget = strings.TrimSpace(target)
+	m.probeDst = dst
+	m.probeReady = ready
+	m.probeTLS = useTLS
+	m.probeServerName = serverName
+	m.probeHostHeader = hostHeader
+	m.mu.Unlock()
+
+	if m.logger != nil {
+		if ready {
+			m.logger.Info("probe target updated: ", m.cfg.ProbeTarget)
+		} else {
+			m.logger.Warn("probe target cleared, health check will be skipped")
+		}
+	}
+	return nil
+}
+
+func (m *Manager) probeAllNodesIfReady(timeout time.Duration) {
+	if _, ok := m.DestinationForProbe(); !ok {
+		return
+	}
+	m.probeAllNodes(timeout)
+}
+
+// BeginNodeSync starts a new "generation" for node registrations.
+// Any Register() calls after this will mark entries with the new generation.
+func (m *Manager) BeginNodeSync() uint64 {
+	m.mu.Lock()
+	m.generation++
+	gen := m.generation
+	m.mu.Unlock()
+	return gen
+}
+
+// PruneNodesNotInGeneration removes nodes that were NOT registered in the given generation.
+// Use this after a reload to drop stale nodes from previous configs/failed reload attempts.
+func (m *Manager) PruneNodesNotInGeneration(gen uint64) int {
+	m.mu.Lock()
+	removed := 0
+	for tag, e := range m.nodes {
+		if e.generation != gen {
+			delete(m.nodes, tag)
+			removed++
+		}
+	}
+	m.mu.Unlock()
+
+	if removed > 0 && m.logger != nil {
+		m.logger.Info("pruned ", removed, " stale nodes")
+	}
+	return removed
+}
+
 // Register ensures a node is tracked and returns its entry.
 func (m *Manager) Register(info NodeInfo) *EntryHandle {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	e, ok := m.nodes[info.Tag]
 	if !ok {
 		e = &entry{
-			info:     info,
-			timeline: make([]TimelineEvent, 0, maxTimelineSize),
+			generation: m.generation,
+			info:       info,
+			timeline:   make([]TimelineEvent, 0, maxTimelineSize),
 		}
 		m.nodes[info.Tag] = e
 	} else {
 		e.info = info
+		e.generation = m.generation
 	}
 	return &EntryHandle{ref: e}
 }
 
 // DestinationForProbe exposes the configured destination for health checks.
 func (m *Manager) DestinationForProbe() (M.Socksaddr, bool) {
-	if !m.probeReady {
+	m.mu.RLock()
+	ready := m.probeReady
+	dst := m.probeDst
+	m.mu.RUnlock()
+
+	if !ready {
 		return M.Socksaddr{}, false
 	}
-	return m.probeDst, true
+	return dst, true
+}
+
+func (m *Manager) ProbeTargetInfo() (dst M.Socksaddr, hostHeader string, useTLS bool, serverName string, ok bool) {
+	m.mu.RLock()
+	ready := m.probeReady
+	dst = m.probeDst
+	hostHeader = m.probeHostHeader
+	useTLS = m.probeTLS
+	serverName = m.probeServerName
+	m.mu.RUnlock()
+
+	if !ready {
+		return M.Socksaddr{}, "", false, "", false
+	}
+	return dst, hostHeader, useTLS, serverName, true
 }
 
 // Snapshot returns a sorted copy of current node states.
@@ -582,6 +776,16 @@ func (h *EntryHandle) SetRelease(fn func()) {
 		return
 	}
 	h.ref.setRelease(fn)
+}
+
+// Health returns current health-check status of the node.
+func (h *EntryHandle) Health() (initialCheckDone bool, available bool) {
+	if h == nil || h.ref == nil {
+		return false, true
+	}
+	h.ref.mu.RLock()
+	defer h.ref.mu.RUnlock()
+	return h.ref.initialCheckDone, h.ref.available
 }
 
 // MarkInitialCheckDone marks the initial health check as completed.

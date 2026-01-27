@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"runtime"
 
 	"easy_proxies/internal/config"
 )
@@ -28,6 +29,10 @@ type NodeManager interface {
 	UpdateNode(ctx context.Context, name string, node config.NodeConfig) (config.NodeConfig, error)
 	DeleteNode(ctx context.Context, name string) error
 	TriggerReload(ctx context.Context) error
+
+	// Settings (thread-safe; implemented by boxmgr.Manager)
+	GetSettings(ctx context.Context) (externalIP string, probeTarget string, skipCertVerify bool, err error)
+	UpdateSettings(ctx context.Context, externalIP, probeTarget string, skipCertVerify bool) error
 }
 
 // Sentinel errors for node operations.
@@ -51,7 +56,7 @@ type SubscriptionStatus struct {
 	LastError     string    `json:"last_error,omitempty"`
 	RefreshCount  int       `json:"refresh_count"`
 	IsRefreshing  bool      `json:"is_refreshing"`
-	NodesModified bool      `json:"nodes_modified"` // True if nodes.txt was modified since last refresh
+	NodesModified bool      `json:"nodes_modified"` 
 }
 
 // Server exposes HTTP endpoints for monitoring.
@@ -141,21 +146,73 @@ func (s *Server) updateSettings(externalIP, probeTarget string, skipCertVerify b
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
 
+	prevExternalIP := s.cfg.ExternalIP
+	prevProbeTarget := s.cfg.ProbeTarget
+	prevSkip := s.cfg.SkipCertVerify
+
+	var prevCfgSrcExternalIP string
+	var prevCfgSrcProbeTarget string
+	var prevCfgSrcSkip bool
+	if s.cfgSrc != nil {
+		prevCfgSrcExternalIP = s.cfgSrc.ExternalIP
+		prevCfgSrcProbeTarget = s.cfgSrc.Management.ProbeTarget
+		prevCfgSrcSkip = s.cfgSrc.SkipCertVerify
+	}
+
+	// Update in-memory server config first
 	s.cfg.ExternalIP = externalIP
 	s.cfg.ProbeTarget = probeTarget
 	s.cfg.SkipCertVerify = skipCertVerify
 
 	if s.cfgSrc == nil {
+		// rollback server cfg
+		s.cfg.ExternalIP = prevExternalIP
+		s.cfg.ProbeTarget = prevProbeTarget
+		s.cfg.SkipCertVerify = prevSkip
 		return errors.New("配置存储未初始化")
 	}
 
+	// Update persistable config object
 	s.cfgSrc.ExternalIP = externalIP
 	s.cfgSrc.Management.ProbeTarget = probeTarget
 	s.cfgSrc.SkipCertVerify = skipCertVerify
 
+	// Apply probe target to runtime monitor manager (also validates probeTarget)
+	if s.mgr != nil {
+		if err := s.mgr.UpdateProbeTarget(probeTarget); err != nil {
+			// rollback server cfg
+			s.cfg.ExternalIP = prevExternalIP
+			s.cfg.ProbeTarget = prevProbeTarget
+			s.cfg.SkipCertVerify = prevSkip
+
+			// rollback cfgSrc
+			s.cfgSrc.ExternalIP = prevCfgSrcExternalIP
+			s.cfgSrc.Management.ProbeTarget = prevCfgSrcProbeTarget
+			s.cfgSrc.SkipCertVerify = prevCfgSrcSkip
+
+			return err
+		}
+	}
+
 	if err := s.cfgSrc.SaveSettings(); err != nil {
+		// rollback runtime manager (best-effort)
+		if s.mgr != nil {
+			_ = s.mgr.UpdateProbeTarget(prevProbeTarget)
+		}
+
+		// rollback server cfg
+		s.cfg.ExternalIP = prevExternalIP
+		s.cfg.ProbeTarget = prevProbeTarget
+		s.cfg.SkipCertVerify = prevSkip
+
+		// rollback cfgSrc
+		s.cfgSrc.ExternalIP = prevCfgSrcExternalIP
+		s.cfgSrc.Management.ProbeTarget = prevCfgSrcProbeTarget
+		s.cfgSrc.SkipCertVerify = prevCfgSrcSkip
+
 		return fmt.Errorf("保存配置失败: %w", err)
 	}
+
 	return nil
 }
 
@@ -203,9 +260,43 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	// 只返回初始检查通过的可用节点
-	payload := map[string]any{"nodes": s.mgr.SnapshotFiltered(true)}
-	writeJSON(w, payload)
+
+	// 只返回监控页需要的字段，避免 timeline/uri 等额外数据导致前端解析与渲染变慢
+	type nodeListItem struct {
+		Tag              string    `json:"tag"`
+		Name             string    `json:"name"`
+		Mode             string    `json:"mode"`
+		Port             uint16    `json:"port,omitempty"`
+		FailureCount     int       `json:"failure_count"`
+		Blacklisted      bool      `json:"blacklisted"`
+		BlacklistedUntil time.Time `json:"blacklisted_until"`
+		ActiveConnections int32    `json:"active_connections"`
+		LastError        string    `json:"last_error,omitempty"`
+		LastFailure      time.Time `json:"last_failure,omitempty"`
+		LastSuccess      time.Time `json:"last_success,omitempty"`
+		LastLatencyMs    int64     `json:"last_latency_ms"`
+	}
+
+	snapshots := s.mgr.SnapshotFiltered(true)
+	nodes := make([]nodeListItem, 0, len(snapshots))
+	for _, snap := range snapshots {
+		nodes = append(nodes, nodeListItem{
+			Tag:               snap.Tag,
+			Name:              snap.Name,
+			Mode:              snap.Mode,
+			Port:              snap.Port,
+			FailureCount:      snap.FailureCount,
+			Blacklisted:       snap.Blacklisted,
+			BlacklistedUntil:  snap.BlacklistedUntil,
+			ActiveConnections: snap.ActiveConnections,
+			LastError:         snap.LastError,
+			LastFailure:       snap.LastFailure,
+			LastSuccess:       snap.LastSuccess,
+			LastLatencyMs:     snap.LastLatencyMs,
+		})
+	}
+
+	writeJSON(w, map[string]any{"nodes": nodes})
 }
 
 func (s *Server) handleDebug(w http.ResponseWriter, r *http.Request) {
@@ -295,7 +386,7 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleProbeAll probes all nodes in batches and returns results via SSE
+// handleProbeAll probes all nodes with bounded concurrency and returns results via SSE.
 func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -306,6 +397,7 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -313,89 +405,172 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get all nodes
 	snapshots := s.mgr.Snapshot()
 	total := len(snapshots)
 	if total == 0 {
-		fmt.Fprintf(w, "data: %s\n\n", `{"type":"complete","total":0,"success":0,"failed":0}`)
+		_ = writeSSE(w, map[string]any{"type": "complete", "total": 0, "success": 0, "failed": 0})
 		flusher.Flush()
 		return
 	}
 
-	// Send start event
-	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"start","total":%d}`, total))
+	if err := writeSSE(w, map[string]any{"type": "start", "total": total}); err != nil {
+		return
+	}
 	flusher.Flush()
 
-	// Probe all nodes concurrently
+	const perProbeTimeout = 10 * time.Second
+
+	workerLimit := runtime.NumCPU() * 2
+	if workerLimit < 8 {
+		workerLimit = 8
+	}
+	if workerLimit > 32 {
+		workerLimit = 32
+	}
+	if workerLimit > total {
+		workerLimit = total
+	}
+
+	// Overall timeout: enough for worst-case (each probe uses full perProbeTimeout)
+	rounds := (total + workerLimit - 1) / workerLimit
+	overallTimeout := time.Duration(rounds)*perProbeTimeout + 5*time.Second
+
+	ctx, cancel := context.WithTimeout(r.Context(), overallTimeout)
+	defer cancel()
+
 	type probeResult struct {
-		tag     string
-		name    string
-		latency int64
-		err     string
+		Tag     string
+		Name    string
+		Latency int64
+		Err     string
 	}
-	results := make(chan probeResult, total)
 
-	// Launch all probes concurrently
-	for _, snap := range snapshots {
-		go func(snap Snapshot, mgr *Manager) {
-			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-			defer cancel()
-			latency, err := mgr.Probe(ctx, snap.Tag)
-			if err != nil {
-				results <- probeResult{tag: snap.Tag, name: snap.Name, latency: -1, err: err.Error()}
-			} else {
-				results <- probeResult{tag: snap.Tag, name: snap.Name, latency: latency.Milliseconds(), err: ""}
+	jobs := make(chan Snapshot)
+	results := make(chan probeResult, workerLimit)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerLimit; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for snap := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+
+				pctx, pcancel := context.WithTimeout(ctx, perProbeTimeout)
+				latency, err := s.mgr.Probe(pctx, snap.Tag)
+				pcancel()
+
+				res := probeResult{
+					Tag:     snap.Tag,
+					Name:    snap.Name,
+					Latency: -1,
+				}
+				if err != nil {
+					res.Err = err.Error()
+				} else {
+					ms := latency.Milliseconds()
+					if ms == 0 && latency > 0 {
+						ms = 1
+					}
+					res.Latency = ms
+				}
+
+				select {
+				case results <- res:
+				case <-ctx.Done():
+					return
+				}
 			}
-		}(snap, s.mgr)
+		}()
 	}
 
-	// Collect results as they come in with overall timeout
+	go func() {
+		defer close(jobs)
+		for _, snap := range snapshots {
+			select {
+			case jobs <- snap:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
 	successCount := 0
 	failedCount := 0
-	timeout := time.After(30 * time.Second) // Overall timeout for all probes
+	current := 0
 
-	for i := 0; i < total; i++ {
+	for {
 		select {
-		case result := <-results:
-			if result.err != "" {
+		case <-ctx.Done():
+			remaining := total - current
+			if remaining > 0 {
+				failedCount += remaining
+				current = total
+			}
+			goto complete
+		case res, ok := <-results:
+			if !ok {
+				goto complete
+			}
+
+			current++
+			if res.Err != "" {
 				failedCount++
 			} else {
 				successCount++
 			}
-			current := successCount + failedCount
+
 			progress := float64(current) / float64(total) * 100
-			eventData := fmt.Sprintf(`{"type":"progress","tag":"%s","name":"%s","latency":%d,"error":"%s","current":%d,"total":%d,"progress":%.1f}`,
-				result.tag, result.name, result.latency, result.err, current, total, progress)
-			fmt.Fprintf(w, "data: %s\n\n", eventData)
-			flusher.Flush()
-		case <-timeout:
-			// Overall timeout reached, report remaining nodes as timed out
-			remaining := total - (successCount + failedCount)
-			for j := 0; j < remaining; j++ {
-				failedCount++
-				current := successCount + failedCount
-				progress := float64(current) / float64(total) * 100
-				eventData := fmt.Sprintf(`{"type":"progress","tag":"unknown","name":"超时节点","latency":-1,"error":"overall timeout","current":%d,"total":%d,"progress":%.1f}`,
-					current, total, progress)
-				fmt.Fprintf(w, "data: %s\n\n", eventData)
-				flusher.Flush()
+			event := map[string]any{
+				"type":     "progress",
+				"tag":      res.Tag,
+				"name":     res.Name,
+				"latency":  res.Latency,
+				"error":    res.Err,
+				"current":  current,
+				"total":    total,
+				"progress": progress,
 			}
-			goto complete
+			if err := writeSSE(w, event); err != nil {
+				return
+			}
+			flusher.Flush()
 		}
 	}
 
 complete:
-
-	// Send complete event
-	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"complete","total":%d,"success":%d,"failed":%d}`, total, successCount, failedCount))
+	if r.Context().Err() != nil {
+		return
+	}
+	_ = writeSSE(w, map[string]any{
+		"type":    "complete",
+		"total":   total,
+		"success": successCount,
+		"failed":  failedCount,
+	})
 	flusher.Flush()
 }
 
 func writeJSON(w http.ResponseWriter, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
 	_ = enc.Encode(payload)
+}
+
+func writeSSE(w http.ResponseWriter, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "data: %s\n\n", data)
+	return err
 }
 
 // withAuth 认证中间件，如果配置了密码则需要验证
@@ -466,6 +641,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		Value:    s.sessionToken,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   86400 * 7, // 7天
 	})
@@ -477,30 +653,54 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleExport 导出所有可用代理池节点的 HTTP 代理 URI，每行一个
-// 在 hybrid 模式下，只导出 multi-port 格式（每节点独立端口）
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
-	// 只导出初始检查通过的可用节点
-	snapshots := s.mgr.SnapshotFiltered(true)
-	var lines []string
+	// Export ONLY nodes that are available in the latest health-check result.
+	// Also skip blacklisted nodes.
+	snapshots := s.mgr.Snapshot()
+
+	// Prefer reading external_ip from the node manager (source of truth).
+	extIP := ""
+	if s.nodeMgr != nil {
+		type settingsGetter interface {
+			GetSettings(ctx context.Context) (externalIP string, probeTarget string, skipCertVerify bool, err error)
+		}
+		if sg, ok := s.nodeMgr.(settingsGetter); ok {
+			if v, _, _, err := sg.GetSettings(r.Context()); err == nil {
+				extIP = v
+			}
+		}
+	}
+	// Fallback to server cached config.
+	if extIP == "" {
+		s.cfgMu.RLock()
+		extIP = s.cfg.ExternalIP
+		s.cfgMu.RUnlock()
+	}
+
+	seen := make(map[string]struct{}, len(snapshots))
+	lines := make([]string, 0, len(snapshots))
 
 	for _, snap := range snapshots {
-		// 只导出有监听地址和端口的节点
+		// Only export nodes that are confirmed available by the latest probe.
+		if !snap.InitialCheckDone || !snap.Available {
+			continue
+		}
+		if snap.Blacklisted {
+			continue
+		}
+
 		if snap.ListenAddress == "" || snap.Port == 0 {
 			continue
 		}
 
-		// 在 hybrid 和 multi-port 模式下，导出每节点独立端口
-		// 在 pool 模式下，所有节点共享同一端口，也正常导出
 		listenAddr := snap.ListenAddress
-		if listenAddr == "0.0.0.0" || listenAddr == "::" {
-			if extIP, _, _ := s.getSettings(); extIP != "" {
-				listenAddr = extIP
-			}
+		if (listenAddr == "0.0.0.0" || listenAddr == "::") && extIP != "" {
+			listenAddr = extIP
 		}
 
 		var proxyURI string
@@ -511,25 +711,47 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		} else {
 			proxyURI = fmt.Sprintf("http://%s:%d", listenAddr, snap.Port)
 		}
+
+		// Deduplicate (Pool mode would otherwise output the same entry N times).
+		if _, ok := seen[proxyURI]; ok {
+			continue
+		}
+		seen[proxyURI] = struct{}{}
 		lines = append(lines, proxyURI)
 	}
 
-	// 返回纯文本，每行一个 URI
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=proxy_pool.txt")
-	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
+
+	if len(lines) == 0 {
+		_, _ = w.Write([]byte(""))
+		return
+	}
+	_, _ = w.Write([]byte(strings.Join(lines, "\n") + "\n"))
 }
 
 // handleSettings handles GET/PUT for dynamic settings (external_ip, probe_target, skip_cert_verify).
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	if s.nodeMgr == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, map[string]any{"error": "节点管理未启用"})
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
-		extIP, probeTarget, skipCertVerify := s.getSettings()
+		extIP, probeTarget, skipCertVerify, err := s.nodeMgr.GetSettings(r.Context())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(w, map[string]any{"error": err.Error()})
+			return
+		}
 		writeJSON(w, map[string]any{
 			"external_ip":      extIP,
 			"probe_target":     probeTarget,
 			"skip_cert_verify": skipCertVerify,
 		})
+
 	case http.MethodPut:
 		var req struct {
 			ExternalIP     string `json:"external_ip"`
@@ -545,19 +767,29 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		extIP := strings.TrimSpace(req.ExternalIP)
 		probeTarget := strings.TrimSpace(req.ProbeTarget)
 
-		if err := s.updateSettings(extIP, probeTarget, req.SkipCertVerify); err != nil {
+		_, _, oldSkip, err := s.nodeMgr.GetSettings(r.Context())
+		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			writeJSON(w, map[string]any{"error": err.Error()})
 			return
 		}
+
+		if err := s.nodeMgr.UpdateSettings(r.Context(), extIP, probeTarget, req.SkipCertVerify); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(w, map[string]any{"error": err.Error()})
+			return
+		}
+
+		needReload := oldSkip != req.SkipCertVerify
 
 		writeJSON(w, map[string]any{
 			"message":          "设置已保存",
 			"external_ip":      extIP,
 			"probe_target":     probeTarget,
 			"skip_cert_verify": req.SkipCertVerify,
-			"need_reload":      true,
+			"need_reload":      needReload,
 		})
+
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -580,13 +812,14 @@ func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request
 
 	status := s.subRefresher.Status()
 	writeJSON(w, map[string]any{
-		"enabled":       true,
-		"last_refresh":  status.LastRefresh,
-		"next_refresh":  status.NextRefresh,
-		"node_count":    status.NodeCount,
-		"last_error":    status.LastError,
-		"refresh_count": status.RefreshCount,
-		"is_refreshing": status.IsRefreshing,
+		"enabled":        true,
+		"last_refresh":   status.LastRefresh,
+		"next_refresh":   status.NextRefresh,
+		"node_count":     status.NodeCount,
+		"last_error":     status.LastError,
+		"refresh_count":  status.RefreshCount,
+		"is_refreshing":  status.IsRefreshing,
+		"nodes_modified": status.NodesModified,
 	})
 }
 

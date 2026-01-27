@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"crypto/tls"
 
 	"easy_proxies/internal/monitor"
 
@@ -32,6 +33,10 @@ const (
 	modeSequential = "sequential"
 	modeRandom     = "random"
 	modeBalance    = "balance"
+
+	// defaultDialAttempts controls how many different candidates we try in one Dial/ListenPacket
+	// before returning error to client.
+	defaultDialAttempts = 3
 )
 
 // Options controls pool outbound behaviour.
@@ -175,10 +180,8 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 	if err != nil {
 		return err
 	}
-	// 在初始化完成后，立即在后台触发健康检查
-	if p.monitor != nil {
-		go p.probeAllMembersOnStartup()
-	}
+	// 不在这里做全量逐个测活（节点多时会很慢且重复）
+	// 健康检查由 monitor.Manager 的 periodic health check 统一执行
 	return nil
 }
 
@@ -235,6 +238,7 @@ func (p *poolOutbound) initializeMembersLocked() error {
 }
 
 // probeAllMembersOnStartup performs initial health checks on all members
+// NOTE: 已不再从 Start() 调用，保留代码避免破坏现有逻辑引用。
 func (p *poolOutbound) probeAllMembersOnStartup() {
 	destination, ok := p.monitor.DestinationForProbe()
 	if !ok {
@@ -310,35 +314,277 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 }
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	member, err := p.pickMember(network)
+	candidates, err := p.pickCandidates(network)
 	if err != nil {
 		return nil, err
 	}
-	p.incActive(member)
-	conn, err := member.outbound.DialContext(ctx, network, destination)
+	defer p.putCandidateBuffer(candidates)
+
+	conn, member, err := p.dialCandidates(ctx, network, destination, candidates)
 	if err != nil {
-		p.decActive(member)
-		p.recordFailure(member, err)
 		return nil, err
 	}
-	p.recordSuccess(member)
 	return p.wrapConn(conn, member), nil
 }
 
 func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	member, err := p.pickMember(N.NetworkUDP)
+	candidates, err := p.pickCandidates(N.NetworkUDP)
 	if err != nil {
 		return nil, err
 	}
-	p.incActive(member)
-	conn, err := member.outbound.ListenPacket(ctx, destination)
+	defer p.putCandidateBuffer(candidates)
+
+	conn, member, err := p.listenPacketCandidates(ctx, destination, candidates)
 	if err != nil {
-		p.decActive(member)
-		p.recordFailure(member, err)
 		return nil, err
 	}
-	p.recordSuccess(member)
 	return p.wrapPacketConn(conn, member), nil
+}
+
+// pickCandidates returns a candidate list with:
+// 1) not blacklisted
+// 2) supports requested network
+// 3) if node has health-check result and it is unavailable -> skip
+// If everything is excluded by health-check, it falls back to ignore health-check to avoid total outage.
+func (p *poolOutbound) pickCandidates(network string) ([]*memberState, error) {
+	now := time.Now()
+	candidates := p.getCandidateBuffer()
+
+	p.mu.Lock()
+	if len(p.members) == 0 {
+		if err := p.initializeMembersLocked(); err != nil {
+			p.mu.Unlock()
+			p.putCandidateBuffer(candidates)
+			return nil, err
+		}
+	}
+
+	candidates = p.availableMembersLocked(now, network, candidates)
+	if len(candidates) == 0 {
+		// fall back: ignore health result, still respect blacklist/network
+		candidates = p.availableMembersIgnoringHealthLocked(now, network, candidates)
+	}
+
+	if len(candidates) == 0 && p.releaseIfAllBlacklistedLocked(now) {
+		candidates = p.availableMembersLocked(now, network, candidates)
+		if len(candidates) == 0 {
+			candidates = p.availableMembersIgnoringHealthLocked(now, network, candidates)
+		}
+	}
+	p.mu.Unlock()
+
+	if len(candidates) == 0 {
+		p.putCandidateBuffer(candidates)
+		return nil, E.New("no healthy proxy available")
+	}
+	return candidates, nil
+}
+
+func (p *poolOutbound) dialCandidates(ctx context.Context, network string, destination M.Socksaddr, candidates []*memberState) (net.Conn, *memberState, error) {
+	if len(candidates) == 0 {
+		return nil, nil, E.New("no healthy proxy available")
+	}
+
+	attempts := defaultDialAttempts
+	if attempts > len(candidates) {
+		attempts = len(candidates)
+	}
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var lastErr error
+
+	switch p.mode {
+	case modeRandom:
+		p.rngMu.Lock()
+		p.rng.Shuffle(len(candidates), func(i, j int) {
+			candidates[i], candidates[j] = candidates[j], candidates[i]
+		})
+		p.rngMu.Unlock()
+
+		for i := 0; i < attempts; i++ {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			member := candidates[i]
+			p.incActive(member)
+			conn, err := member.outbound.DialContext(ctx, network, destination)
+			if err != nil {
+				p.decActive(member)
+				p.recordFailure(member, err)
+				lastErr = err
+				continue
+			}
+			p.recordSuccess(member)
+			return conn, member, nil
+		}
+
+	case modeBalance:
+		remaining := candidates
+		for i := 0; i < attempts && len(remaining) > 0; i++ {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+
+			idx := leastActiveIndex(remaining)
+			member := remaining[idx]
+
+			p.incActive(member)
+			conn, err := member.outbound.DialContext(ctx, network, destination)
+			if err != nil {
+				p.decActive(member)
+				p.recordFailure(member, err)
+				lastErr = err
+
+				// remove member from remaining
+				last := len(remaining) - 1
+				remaining[idx] = remaining[last]
+				remaining = remaining[:last]
+				continue
+			}
+			p.recordSuccess(member)
+			return conn, member, nil
+		}
+
+	default: // sequential
+		start := int(p.rrCounter.Add(1)-1) % len(candidates)
+		for i := 0; i < attempts; i++ {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			member := candidates[(start+i)%len(candidates)]
+			p.incActive(member)
+			conn, err := member.outbound.DialContext(ctx, network, destination)
+			if err != nil {
+				p.decActive(member)
+				p.recordFailure(member, err)
+				lastErr = err
+				continue
+			}
+			p.recordSuccess(member)
+			return conn, member, nil
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = E.New("no healthy proxy available")
+	}
+	return nil, nil, E.New("dial failed after ", attempts, " attempts: ", lastErr)
+}
+
+func (p *poolOutbound) listenPacketCandidates(ctx context.Context, destination M.Socksaddr, candidates []*memberState) (net.PacketConn, *memberState, error) {
+	if len(candidates) == 0 {
+		return nil, nil, E.New("no healthy proxy available")
+	}
+
+	attempts := defaultDialAttempts
+	if attempts > len(candidates) {
+		attempts = len(candidates)
+	}
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var lastErr error
+
+	switch p.mode {
+	case modeRandom:
+		p.rngMu.Lock()
+		p.rng.Shuffle(len(candidates), func(i, j int) {
+			candidates[i], candidates[j] = candidates[j], candidates[i]
+		})
+		p.rngMu.Unlock()
+
+		for i := 0; i < attempts; i++ {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			member := candidates[i]
+			p.incActive(member)
+			conn, err := member.outbound.ListenPacket(ctx, destination)
+			if err != nil {
+				p.decActive(member)
+				p.recordFailure(member, err)
+				lastErr = err
+				continue
+			}
+			p.recordSuccess(member)
+			return conn, member, nil
+		}
+
+	case modeBalance:
+		remaining := candidates
+		for i := 0; i < attempts && len(remaining) > 0; i++ {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+
+			idx := leastActiveIndex(remaining)
+			member := remaining[idx]
+
+			p.incActive(member)
+			conn, err := member.outbound.ListenPacket(ctx, destination)
+			if err != nil {
+				p.decActive(member)
+				p.recordFailure(member, err)
+				lastErr = err
+
+				last := len(remaining) - 1
+				remaining[idx] = remaining[last]
+				remaining = remaining[:last]
+				continue
+			}
+			p.recordSuccess(member)
+			return conn, member, nil
+		}
+
+	default: // sequential
+		start := int(p.rrCounter.Add(1)-1) % len(candidates)
+		for i := 0; i < attempts; i++ {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			member := candidates[(start+i)%len(candidates)]
+			p.incActive(member)
+			conn, err := member.outbound.ListenPacket(ctx, destination)
+			if err != nil {
+				p.decActive(member)
+				p.recordFailure(member, err)
+				lastErr = err
+				continue
+			}
+			p.recordSuccess(member)
+			return conn, member, nil
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = E.New("no healthy proxy available")
+	}
+	return nil, nil, E.New("listenPacket failed after ", attempts, " attempts: ", lastErr)
+}
+
+func leastActiveIndex(candidates []*memberState) int {
+	if len(candidates) <= 1 {
+		return 0
+	}
+	minIdx := 0
+	minActive := int32(0)
+	if candidates[0].shared != nil {
+		minActive = candidates[0].shared.activeCount()
+	}
+	for i := 1; i < len(candidates); i++ {
+		active := int32(0)
+		if candidates[i].shared != nil {
+			active = candidates[i].shared.activeCount()
+		}
+		if active < minActive {
+			minActive = active
+			minIdx = i
+		}
+	}
+	return minIdx
 }
 
 func (p *poolOutbound) pickMember(network string) (*memberState, error) {
@@ -378,6 +624,29 @@ func (p *poolOutbound) availableMembersLocked(now time.Time, network string, buf
 	result := buf[:0]
 	for _, member := range p.members {
 		// Check blacklist via shared state (auto-clears if expired)
+		if member.shared != nil && member.shared.isBlacklisted(now) {
+			continue
+		}
+		if network != "" && !common.Contains(member.outbound.Network(), network) {
+			continue
+		}
+
+		// 如果健康检查已完成且明确不可用，则跳过
+		if member.entry != nil {
+			done, available := member.entry.Health()
+			if done && !available {
+				continue
+			}
+		}
+
+		result = append(result, member)
+	}
+	return result
+}
+
+func (p *poolOutbound) availableMembersIgnoringHealthLocked(now time.Time, network string, buf []*memberState) []*memberState {
+	result := buf[:0]
+	for _, member := range p.members {
 		if member.shared != nil && member.shared.isBlacklisted(now) {
 			continue
 		}
@@ -507,15 +776,42 @@ func httpProbe(conn net.Conn, host string) (time.Duration, error) {
 	return ttfb, nil
 }
 
+func httpsProbe(ctx context.Context, conn net.Conn, serverName, hostHeader string) (time.Duration, error) {
+	tlsCfg := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"http/1.1"},
+	}
+	if serverName != "" {
+		tlsCfg.ServerName = serverName
+	}
+
+	tlsConn := tls.Client(conn, tlsCfg)
+
+	// Best-effort deadline for handshake
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = tlsConn.SetDeadline(deadline)
+	} else {
+		_ = tlsConn.SetDeadline(time.Now().Add(15 * time.Second))
+	}
+
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return 0, fmt.Errorf("tls handshake: %w", err)
+	}
+
+	// After TLS handshake, do HTTP probe over TLS.
+	return httpProbe(tlsConn, hostHeader)
+}
+
 func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Context) (time.Duration, error) {
 	if p.monitor == nil {
 		return nil
 	}
-	destination, ok := p.monitor.DestinationForProbe()
-	if !ok {
-		return nil
-	}
 	return func(ctx context.Context) (time.Duration, error) {
+		destination, hostHeader, useTLS, serverName, ok := p.monitor.ProbeTargetInfo()
+		if !ok {
+			return 0, E.New("probe target not configured")
+		}
+
 		start := time.Now()
 		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
 		if err != nil {
@@ -526,8 +822,11 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		}
 		defer conn.Close()
 
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
+		if useTLS {
+			_, err = httpsProbe(ctx, conn, serverName, hostHeader)
+		} else {
+			_, err = httpProbe(conn, hostHeader)
+		}
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
@@ -535,7 +834,6 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 			return 0, err
 		}
 
-		// Total duration = dial time + HTTP probe
 		duration := time.Since(start)
 		if member.entry != nil {
 			member.entry.RecordSuccessWithLatency(duration)
@@ -549,11 +847,12 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 	if p.monitor == nil {
 		return nil
 	}
-	destination, ok := p.monitor.DestinationForProbe()
-	if !ok {
-		return nil
-	}
 	return func(ctx context.Context) (time.Duration, error) {
+		destination, hostHeader, useTLS, serverName, ok := p.monitor.ProbeTargetInfo()
+		if !ok {
+			return 0, E.New("probe target not configured")
+		}
+
 		// Ensure members are initialized
 		p.mu.Lock()
 		if len(p.members) == 0 {
@@ -587,8 +886,11 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		}
 		defer conn.Close()
 
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
+		if useTLS {
+			_, err = httpsProbe(ctx, conn, serverName, hostHeader)
+		} else {
+			_, err = httpProbe(conn, hostHeader)
+		}
 		if err != nil {
 			if member.entry != nil {
 				member.entry.RecordFailure(err)
@@ -596,7 +898,6 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 			return 0, err
 		}
 
-		// Total duration = dial time + TTFB
 		duration := time.Since(start)
 		if member.entry != nil {
 			member.entry.RecordSuccessWithLatency(duration)

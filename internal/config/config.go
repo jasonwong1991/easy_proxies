@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,16 +27,16 @@ type Config struct {
 	Management          ManagementConfig          `yaml:"management"`
 	SubscriptionRefresh SubscriptionRefreshConfig `yaml:"subscription_refresh"`
 	Nodes               []NodeConfig              `yaml:"nodes"`
-	NodesFile           string                    `yaml:"nodes_file"`    // 节点文件路径，每行一个 URI
+	NodesFile           string                    `yaml:"nodes_file"`    // 手工节点文件路径
 	Subscriptions       []string                  `yaml:"subscriptions"` // 订阅链接列表
-	ExternalIP          string                    `yaml:"external_ip"`      // 外部 IP 地址，用于导出时替换 0.0.0.0
+	ExternalIP          string                    `yaml:"external_ip"`   // 外部 IP 地址，用于导出时替换 0.0.0.0
 	LogLevel            string                    `yaml:"log_level"`
 	SkipCertVerify      bool                      `yaml:"skip_cert_verify"` // 全局跳过 SSL 证书验证
 
 	filePath string `yaml:"-"` // 配置文件路径，用于保存
 }
 
-// ListenerConfig defines how the HTTP proxy should listen for clients.
+// ListenerConfig defines how the HTTP/SOCKS proxy should listen for clients.
 type ListenerConfig struct {
 	Address  string `yaml:"address"`
 	Port     uint16 `yaml:"port"`
@@ -81,7 +82,7 @@ type NodeSource string
 
 const (
 	NodeSourceInline       NodeSource = "inline"       // Defined directly in config.yaml nodes array
-	NodeSourceFile         NodeSource = "nodes_file"   // Loaded from external nodes file
+	NodeSourceFile         NodeSource = "nodes_file"   // Loaded from nodes_file
 	NodeSourceSubscription NodeSource = "subscription" // Fetched from subscription URL
 )
 
@@ -98,7 +99,7 @@ type NodeConfig struct {
 // NodeKey returns a unique identifier for the node based on its URI.
 // This is used to preserve port assignments across reloads.
 func (n *NodeConfig) NodeKey() string {
-	return n.URI
+	return strings.TrimSpace(n.URI)
 }
 
 // Load reads YAML config from disk and applies defaults/validation.
@@ -138,6 +139,7 @@ func (c *Config) normalize() error {
 	default:
 		return fmt.Errorf("unsupported mode %q (use 'pool', 'multi-port', or 'hybrid')", c.Mode)
 	}
+
 	if c.Listener.Address == "" {
 		c.Listener.Address = "0.0.0.0"
 	}
@@ -157,7 +159,7 @@ func (c *Config) normalize() error {
 		c.MultiPort.Address = "0.0.0.0"
 	}
 	if c.MultiPort.BasePort == 0 {
-		c.MultiPort.BasePort = 28000
+		c.MultiPort.BasePort = 24000
 	}
 	if c.Management.Listen == "" {
 		c.Management.Listen = "127.0.0.1:9090"
@@ -192,21 +194,25 @@ func (c *Config) normalize() error {
 		c.Nodes[idx].Source = NodeSourceInline
 	}
 
-	// Load nodes from file if specified (but NOT if subscriptions exist - subscription takes priority)
-	if c.NodesFile != "" && len(c.Subscriptions) == 0 {
-		fileNodes, err := loadNodesFromFile(c.NodesFile)
+	inlineNodes := make([]NodeConfig, len(c.Nodes))
+	copy(inlineNodes, c.Nodes)
+
+	// Always load nodes from nodes_file if specified (even when subscriptions exist)
+	var fileNodes []NodeConfig
+	if c.NodesFile != "" {
+		nodes, err := loadNodesFromFile(c.NodesFile)
 		if err != nil {
 			return fmt.Errorf("load nodes from file %q: %w", c.NodesFile, err)
 		}
-		for idx := range fileNodes {
-			fileNodes[idx].Source = NodeSourceFile
+		for idx := range nodes {
+			nodes[idx].Source = NodeSourceFile
 		}
-		c.Nodes = append(c.Nodes, fileNodes...)
+		fileNodes = nodes
 	}
 
-	// Load nodes from subscriptions (highest priority - writes to nodes.txt)
+	// Load nodes from subscriptions (append; write to subscription cache file, not nodes_file)
+	var subNodes []NodeConfig
 	if len(c.Subscriptions) > 0 {
-		var subNodes []NodeConfig
 		subTimeout := c.SubscriptionRefresh.Timeout
 		for _, subURL := range c.Subscriptions {
 			nodes, err := loadNodesFromSubscription(subURL, subTimeout)
@@ -217,30 +223,36 @@ func (c *Config) normalize() error {
 			log.Printf("✅ Loaded %d nodes from subscription", len(nodes))
 			subNodes = append(subNodes, nodes...)
 		}
-		// Mark subscription nodes and write to nodes.txt
+
 		for idx := range subNodes {
 			subNodes[idx].Source = NodeSourceSubscription
 		}
+
 		if len(subNodes) > 0 {
-			// Determine nodes.txt path
-			nodesFilePath := c.NodesFile
-			if nodesFilePath == "" {
-				nodesFilePath = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
-				c.NodesFile = nodesFilePath
-			}
-			// Write subscription nodes to nodes.txt
-			if err := writeNodesToFile(nodesFilePath, subNodes); err != nil {
-				log.Printf("⚠️ Failed to write nodes to %q: %v", nodesFilePath, err)
-			} else {
-				log.Printf("✅ Written %d subscription nodes to %s", len(subNodes), nodesFilePath)
+			subPath := c.subscriptionCacheFilePath()
+			if subPath != "" {
+				if err := writeNodesToFile(subPath, subNodes); err != nil {
+					log.Printf("⚠️ Failed to write subscription cache to %q: %v", subPath, err)
+				} else {
+					log.Printf("✅ Written %d subscription nodes to %s", len(subNodes), subPath)
+				}
 			}
 		}
-		c.Nodes = append(c.Nodes, subNodes...)
 	}
 
+	// Merge order: inline -> subscription -> file
+	c.Nodes = nil
+	c.Nodes = append(c.Nodes, inlineNodes...)
+	c.Nodes = append(c.Nodes, subNodes...)
+	c.Nodes = append(c.Nodes, fileNodes...)
+
+	// Dedupe by URI, keep first (subscription wins over file duplicates)
+	c.Nodes = dedupeNodesKeepFirst(c.Nodes)
+
 	if len(c.Nodes) == 0 {
-		return errors.New("config.nodes cannot be empty (configure nodes in config or use nodes_file)")
+		return errors.New("config.nodes cannot be empty (configure nodes/nodes_file/subscriptions)")
 	}
+
 	portCursor := c.MultiPort.BasePort
 	for idx := range c.Nodes {
 		c.Nodes[idx].Name = strings.TrimSpace(c.Nodes[idx].Name)
@@ -253,7 +265,6 @@ func (c *Config) normalize() error {
 		// Auto-extract name from URI fragment (#name) if not provided
 		if c.Nodes[idx].Name == "" {
 			if parsed, err := url.Parse(c.Nodes[idx].URI); err == nil && parsed.Fragment != "" {
-				// URL decode the fragment to handle encoded characters
 				if decoded, err := url.QueryUnescape(parsed.Fragment); err == nil {
 					c.Nodes[idx].Name = decoded
 				} else {
@@ -290,6 +301,7 @@ func (c *Config) normalize() error {
 			}
 		}
 	}
+
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
 	}
@@ -304,7 +316,6 @@ func (c *Config) normalize() error {
 		}
 		for idx := range c.Nodes {
 			if c.Nodes[idx].Port == poolPort {
-				// Find next available port
 				newPort := c.Nodes[idx].Port + 1
 				for usedPorts[newPort] || !isPortAvailable(c.MultiPort.Address, newPort) {
 					newPort++
@@ -323,19 +334,18 @@ func (c *Config) normalize() error {
 }
 
 // BuildPortMap creates a mapping from node URI to port for existing nodes.
-// This is used to preserve port assignments when reloading configuration.
 func (c *Config) BuildPortMap() map[string]uint16 {
 	portMap := make(map[string]uint16)
 	for _, node := range c.Nodes {
-		if node.Port > 0 {
-			portMap[node.NodeKey()] = node.Port
+		key := node.NodeKey()
+		if key != "" && node.Port > 0 {
+			portMap[key] = node.Port
 		}
 	}
 	return portMap
 }
 
-// NormalizeWithPortMap applies defaults and validation, preserving port assignments
-// for nodes that exist in the provided port map.
+// NormalizeWithPortMap applies defaults and validation, preserving port assignments.
 func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	if c.Mode == "" {
 		c.Mode = "pool"
@@ -367,7 +377,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 		c.MultiPort.Address = "0.0.0.0"
 	}
 	if c.MultiPort.BasePort == 0 {
-		c.MultiPort.BasePort = 28000
+		c.MultiPort.BasePort = 24000
 	}
 	if c.Management.Listen == "" {
 		c.Management.Listen = "127.0.0.1:9090"
@@ -399,7 +409,6 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 		return errors.New("config.nodes cannot be empty")
 	}
 
-	// Build set of ports already assigned from portMap
 	usedPorts := make(map[uint16]bool)
 	if c.Mode == "hybrid" {
 		usedPorts[c.Listener.Port] = true
@@ -413,7 +422,6 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 			return fmt.Errorf("node %d is missing uri", idx)
 		}
 
-		// Extract name from URI fragment if not provided
 		if c.Nodes[idx].Name == "" {
 			if parsed, err := url.Parse(c.Nodes[idx].URI); err == nil && parsed.Fragment != "" {
 				if decoded, err := url.QueryUnescape(parsed.Fragment); err == nil {
@@ -427,7 +435,6 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 			c.Nodes[idx].Name = fmt.Sprintf("node-%d", idx)
 		}
 
-		// Check if this node has a preserved port from portMap
 		if c.Mode == "multi-port" || c.Mode == "hybrid" {
 			nodeKey := c.Nodes[idx].NodeKey()
 			if existingPort, ok := portMap[nodeKey]; ok && existingPort > 0 {
@@ -442,7 +449,6 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	portCursor := c.MultiPort.BasePort
 	for idx := range c.Nodes {
 		if c.Nodes[idx].Port == 0 && (c.Mode == "multi-port" || c.Mode == "hybrid") {
-			// Find next available port that's not used
 			for usedPorts[portCursor] || !isPortAvailable(c.MultiPort.Address, portCursor) {
 				portCursor++
 				if portCursor > 65535 {
@@ -458,7 +464,6 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 			portCursor++
 		}
 
-		// Apply default credentials
 		if c.Mode == "multi-port" || c.Mode == "hybrid" {
 			if c.Nodes[idx].Username == "" {
 				c.Nodes[idx].Username = c.MultiPort.Username
@@ -482,18 +487,19 @@ func (c *Config) ManagementEnabled() bool {
 	return *c.Management.Enabled
 }
 
-// loadNodesFromFile reads a nodes file where each line is a proxy URI
-// Lines starting with # are comments, empty lines are ignored
+// loadNodesFromFile reads a nodes file where each line is a proxy URI.
+// Lines starting with # are comments, empty lines are ignored.
+// Additionally supports plain "host:port" lines (default scheme derived from filename).
 func loadNodesFromFile(path string) ([]NodeConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return parseNodesFromContent(string(data))
+	defaultScheme := defaultPlainSchemeFromName(filepath.Base(path), "")
+	return parseNodesFromContentWithHint(string(data), defaultScheme)
 }
 
-// loadNodesFromSubscription fetches and parses nodes from a subscription URL
-// Supports multiple formats: base64 encoded, plain text, clash yaml, etc.
+// loadNodesFromSubscription fetches and parses nodes from a subscription URL.
 func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConfig, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -502,12 +508,20 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 		Timeout: timeout,
 	}
 
-	req, err := http.NewRequest("GET", subURL, nil)
+	requestURL := subURL
+	defaultScheme := "http"
+
+	if u, err := url.Parse(subURL); err == nil && u != nil {
+		defaultScheme = defaultPlainSchemeFromName(u.Path, u.Fragment)
+		u.Fragment = ""
+		requestURL = u.String()
+	}
+
+	req, err := http.NewRequest("GET", requestURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	// Set common headers to avoid being blocked
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Accept", "*/*")
 
@@ -526,82 +540,165 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
-	content := string(body)
-
-	// Try to detect and parse different formats
-	return parseSubscriptionContent(content)
+	return ParseSubscriptionContentWithHint(string(body), defaultScheme)
 }
 
-// parseSubscriptionContent tries to parse subscription content in various formats
-func parseSubscriptionContent(content string) ([]NodeConfig, error) {
+// ParseSubscriptionContentWithHint parses subscription content in various formats.
+// defaultScheme is used when parsing plain "host:port" lists (e.g., socks5/http/https).
+func ParseSubscriptionContentWithHint(content string, defaultScheme string) ([]NodeConfig, error) {
 	content = strings.TrimSpace(content)
 
-	// Check if it's base64 encoded (common for v2ray subscriptions)
 	if isBase64(content) {
 		decoded, err := base64.StdEncoding.DecodeString(content)
 		if err != nil {
-			// Try URL-safe base64
 			decoded, err = base64.RawStdEncoding.DecodeString(content)
 			if err != nil {
-				// Not base64, try as plain text
-				return parseNodesFromContent(content)
+				return parseNodesFromContentWithHint(content, defaultScheme)
 			}
 		}
 		content = string(decoded)
 	}
 
-	// Check if it's YAML (Clash format)
-	if strings.Contains(content, "proxies:") {
+	if looksLikeClashYAML(content) {
 		return parseClashYAML(content)
 	}
 
-	// Parse as plain text (one URI per line)
-	return parseNodesFromContent(content)
+	return parseNodesFromContentWithHint(content, defaultScheme)
 }
 
-// parseNodesFromContent parses nodes from plain text content (one URI per line)
+// ParseSubscriptionContent tries to parse subscription content in various formats.
+func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
+	return ParseSubscriptionContentWithHint(content, "")
+}
+
+// looksLikeClashYAML detects Clash YAML by finding a "proxies:" key at line start.
+func looksLikeClashYAML(content string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "proxies:") {
+			return true
+		}
+	}
+	return false
+}
+
+// parseNodesFromContent parses nodes from plain text content.
 func parseNodesFromContent(content string) ([]NodeConfig, error) {
+	return parseNodesFromContentWithHint(content, "")
+}
+
+func parseNodesFromContentWithHint(content string, defaultScheme string) ([]NodeConfig, error) {
 	var nodes []NodeConfig
 	lines := strings.Split(content, "\n")
+
+	scheme := normalizePlainSchemeHint(defaultScheme)
+	if scheme == "" {
+		scheme = "http"
+	}
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 
-		// Skip empty lines and comments
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// Check if it's a valid proxy URI
-		if isProxyURI(line) {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		token := strings.TrimSpace(fields[0])
+		if token == "" || strings.HasPrefix(token, "#") {
+			continue
+		}
+
+		if isProxyURI(token) {
+			node := NodeConfig{URI: token}
+			if u, err := url.Parse(token); err == nil && u != nil {
+				if u.Fragment != "" {
+					if decoded, err := url.QueryUnescape(u.Fragment); err == nil && decoded != "" {
+						node.Name = decoded
+					} else {
+						node.Name = u.Fragment
+					}
+				} else if u.Host != "" {
+					node.Name = u.Host
+				}
+			}
+			nodes = append(nodes, node)
+			continue
+		}
+
+		if hostport, ok := normalizeHostPort(token); ok {
 			nodes = append(nodes, NodeConfig{
-				URI: line,
+				Name: hostport,
+				URI:  fmt.Sprintf("%s://%s", scheme, hostport),
 			})
+			continue
 		}
 	}
 
 	return nodes, nil
 }
 
-// isBase64 checks if a string looks like base64 encoded content
+func normalizeHostPort(token string) (string, bool) {
+	if strings.Contains(token, "://") {
+		return "", false
+	}
+	if strings.Count(token, ":") > 1 && !strings.HasPrefix(token, "[") {
+		return "", false
+	}
+	_, portStr, err := net.SplitHostPort(token)
+	if err != nil {
+		return "", false
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil || p <= 0 || p > 65535 {
+		return "", false
+	}
+	return token, true
+}
+
+func normalizePlainSchemeHint(value string) string {
+	v := strings.ToLower(strings.TrimSpace(value))
+	switch v {
+	case "http", "https", "socks5", "socks5h":
+		return v
+	case "socks":
+		return "socks5"
+	default:
+		return ""
+	}
+}
+
+func defaultPlainSchemeFromName(nameHint string, explicitHint string) string {
+	if v := normalizePlainSchemeHint(explicitHint); v != "" {
+		return v
+	}
+	lower := strings.ToLower(nameHint)
+	if strings.Contains(lower, "socks5") || strings.Contains(lower, "socks") {
+		return "socks5"
+	}
+	if strings.Contains(lower, "https") {
+		return "https"
+	}
+	if strings.Contains(lower, "http") {
+		return "http"
+	}
+	return "http"
+}
+
+// isBase64 checks if a string looks like base64 encoded content.
 func isBase64(s string) bool {
-	// Remove whitespace
 	s = strings.TrimSpace(s)
 	if len(s) == 0 {
 		return false
 	}
-
-	// Base64 should not contain newlines in the middle (unless it's multi-line base64)
-	// and should only contain valid base64 characters
 	s = strings.ReplaceAll(s, "\n", "")
 	s = strings.ReplaceAll(s, "\r", "")
-
-	// Check if it contains proxy URI schemes (then it's not base64)
 	if strings.Contains(s, "://") {
 		return false
 	}
-
-	// Try to decode
 	_, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
 		_, err = base64.RawStdEncoding.DecodeString(s)
@@ -609,44 +706,51 @@ func isBase64(s string) bool {
 	return err == nil
 }
 
-// isProxyURI checks if a string is a valid proxy URI
+// isProxyURI checks if a string is a valid proxy URI.
 func isProxyURI(s string) bool {
-	schemes := []string{"vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://"}
+	schemes := []string{
+		"vmess://", "vless://", "trojan://", "ss://", "ssr://",
+		"hysteria://", "hysteria2://", "hy2://",
+		"http://", "https://",
+		"socks://", "socks5://", "socks5h://", "socks4://", "socks4a://",
+	}
+	lower := strings.ToLower(s)
 	for _, scheme := range schemes {
-		if strings.HasPrefix(strings.ToLower(s), scheme) {
+		if strings.HasPrefix(lower, scheme) {
 			return true
 		}
 	}
 	return false
 }
 
-// clashConfig represents a minimal Clash configuration for parsing proxies
+// clashConfig represents a minimal Clash configuration for parsing proxies.
 type clashConfig struct {
 	Proxies []clashProxy `yaml:"proxies"`
 }
 
 type clashProxy struct {
-	Name           string                 `yaml:"name"`
-	Type           string                 `yaml:"type"`
-	Server         string                 `yaml:"server"`
-	Port           int                    `yaml:"port"`
-	UUID           string                 `yaml:"uuid"`
-	Password       string                 `yaml:"password"`
-	Cipher         string                 `yaml:"cipher"`
-	AlterId        int                    `yaml:"alterId"`
-	Network        string                 `yaml:"network"`
-	TLS            bool                   `yaml:"tls"`
-	SkipCertVerify bool                   `yaml:"skip-cert-verify"`
-	ServerName     string                 `yaml:"servername"`
-	SNI            string                 `yaml:"sni"`
-	Flow           string                 `yaml:"flow"`
-	UDP            bool                   `yaml:"udp"`
-	WSOpts         *clashWSOptions        `yaml:"ws-opts"`
-	GrpcOpts       *clashGrpcOptions      `yaml:"grpc-opts"`
-	RealityOpts    *clashRealityOptions   `yaml:"reality-opts"`
-	ClientFingerprint string              `yaml:"client-fingerprint"`
-	Plugin         string                 `yaml:"plugin"`
-	PluginOpts     map[string]interface{} `yaml:"plugin-opts"`
+	Name              string                 `yaml:"name"`
+	Type              string                 `yaml:"type"`
+	Server            string                 `yaml:"server"`
+	Port              int                    `yaml:"port"`
+	UUID              string                 `yaml:"uuid"`
+	Username          string                 `yaml:"username"`
+	Password          string                 `yaml:"password"`
+	Cipher            string                 `yaml:"cipher"`
+	AlterId           int                    `yaml:"alterId"`
+	Network           string                 `yaml:"network"`
+	TLS               bool                   `yaml:"tls"`
+	SkipCertVerify    bool                   `yaml:"skip-cert-verify"`
+	ServerName        string                 `yaml:"servername"`
+	SNI               string                 `yaml:"sni"`
+	Flow              string                 `yaml:"flow"`
+	UDP               bool                   `yaml:"udp"`
+	WSOpts            *clashWSOptions        `yaml:"ws-opts"`
+	GrpcOpts          *clashGrpcOptions      `yaml:"grpc-opts"`
+	RealityOpts       *clashRealityOptions   `yaml:"reality-opts"`
+	ClientFingerprint string                 `yaml:"client-fingerprint"`
+	Plugin            string                 `yaml:"plugin"`
+	PluginOpts        map[string]interface{} `yaml:"plugin-opts"`
 }
 
 type clashWSOptions struct {
@@ -663,7 +767,7 @@ type clashRealityOptions struct {
 	ShortID   string `yaml:"short-id"`
 }
 
-// parseClashYAML parses Clash YAML format and converts to NodeConfig
+// parseClashYAML parses Clash YAML format and converts to NodeConfig.
 func parseClashYAML(content string) ([]NodeConfig, error) {
 	var clash clashConfig
 	if err := yaml.Unmarshal([]byte(content), &clash); err != nil {
@@ -684,7 +788,7 @@ func parseClashYAML(content string) ([]NodeConfig, error) {
 	return nodes, nil
 }
 
-// convertClashProxyToURI converts a Clash proxy config to a standard URI
+// convertClashProxyToURI converts a Clash proxy config to a standard URI.
 func convertClashProxyToURI(p clashProxy) string {
 	switch strings.ToLower(p.Type) {
 	case "vmess":
@@ -697,6 +801,10 @@ func convertClashProxyToURI(p clashProxy) string {
 		return buildShadowsocksURI(p)
 	case "hysteria2", "hy2":
 		return buildHysteria2URI(p)
+	case "http", "https":
+		return buildHTTPProxyURI(p)
+	case "socks5", "socks", "socks4", "socks4a":
+		return buildSocksProxyURI(p)
 	default:
 		return ""
 	}
@@ -817,7 +925,6 @@ func buildTrojanURI(p clashProxy) string {
 }
 
 func buildShadowsocksURI(p clashProxy) string {
-	// Encode method:password in base64
 	userInfo := base64.StdEncoding.EncodeToString([]byte(p.Cipher + ":" + p.Password))
 	return fmt.Sprintf("ss://%s@%s:%d#%s", userInfo, p.Server, p.Port, url.QueryEscape(p.Name))
 }
@@ -841,6 +948,51 @@ func buildHysteria2URI(p clashProxy) string {
 	return fmt.Sprintf("hysteria2://%s@%s:%d%s#%s", p.Password, p.Server, p.Port, query, url.QueryEscape(p.Name))
 }
 
+func buildHTTPProxyURI(p clashProxy) string {
+	scheme := "http"
+	if p.TLS {
+		scheme = "https"
+	}
+
+	params := url.Values{}
+	sni := p.ServerName
+	if sni == "" {
+		sni = p.SNI
+	}
+	if sni != "" {
+		params.Set("sni", sni)
+	}
+	if p.SkipCertVerify {
+		params.Set("allowInsecure", "1")
+	}
+
+	query := ""
+	if len(params) > 0 {
+		query = "?" + params.Encode()
+	}
+
+	authPart := ""
+	if p.Username != "" {
+		authPart = url.UserPassword(p.Username, p.Password).String() + "@"
+	}
+
+	return fmt.Sprintf("%s://%s%s:%d%s#%s", scheme, authPart, p.Server, p.Port, query, url.QueryEscape(p.Name))
+}
+
+func buildSocksProxyURI(p clashProxy) string {
+	scheme := strings.ToLower(strings.TrimSpace(p.Type))
+	if scheme == "" || scheme == "socks" {
+		scheme = "socks5"
+	}
+
+	authPart := ""
+	if p.Username != "" {
+		authPart = url.UserPassword(p.Username, p.Password).String() + "@"
+	}
+
+	return fmt.Sprintf("%s://%s%s:%d#%s", scheme, authPart, p.Server, p.Port, url.QueryEscape(p.Name))
+}
+
 // FilePath returns the config file path.
 func (c *Config) FilePath() string {
 	if c == nil {
@@ -856,11 +1008,36 @@ func (c *Config) SetFilePath(path string) {
 	}
 }
 
+// subscriptionCacheFilePath returns the derived subscription cache file path.
+// If nodes_file is "nodes.txt", cache will be "nodes.subscription.txt" in the same directory.
+func (c *Config) subscriptionCacheFilePath() string {
+	if c == nil || c.filePath == "" {
+		return ""
+	}
+
+	if c.NodesFile != "" {
+		dir := filepath.Dir(c.NodesFile)
+		base := filepath.Base(c.NodesFile)
+		if strings.HasSuffix(base, ".txt") {
+			base = strings.TrimSuffix(base, ".txt") + ".subscription.txt"
+		} else {
+			base = base + ".subscription"
+		}
+		return filepath.Join(dir, base)
+	}
+
+	return filepath.Join(filepath.Dir(c.filePath), "nodes.subscription.txt")
+}
+
 // writeNodesToFile writes nodes to a file (one URI per line).
 func writeNodesToFile(path string, nodes []NodeConfig) error {
 	var lines []string
 	for _, node := range nodes {
-		lines = append(lines, node.URI)
+		uri := strings.TrimSpace(node.URI)
+		if uri == "" {
+			continue
+		}
+		lines = append(lines, uri)
 	}
 	content := strings.Join(lines, "\n")
 	if len(lines) > 0 {
@@ -870,9 +1047,9 @@ func writeNodesToFile(path string, nodes []NodeConfig) error {
 }
 
 // SaveNodes persists nodes to their appropriate locations based on source.
-// - subscription/nodes_file nodes → nodes.txt (or configured nodes_file)
-// - inline nodes → config.yaml nodes array
-// Config.yaml structure (subscriptions, nodes_file) is preserved.
+// - NodeSourceFile -> nodes_file
+// - NodeSourceSubscription -> subscription cache file
+// - NodeSourceInline -> config.yaml nodes array
 func (c *Config) SaveNodes() error {
 	if c == nil {
 		return errors.New("config is nil")
@@ -881,13 +1058,12 @@ func (c *Config) SaveNodes() error {
 		return errors.New("config file path is unknown")
 	}
 
-	// Separate nodes by source
 	var inlineNodes []NodeConfig
 	var fileNodes []NodeConfig
+	var subNodes []NodeConfig
 
 	for _, node := range c.Nodes {
-		// Create a clean copy without runtime fields for saving
-		cleanNode := NodeConfig{
+		clean := NodeConfig{
 			Name:     node.Name,
 			URI:      node.URI,
 			Port:     node.Port,
@@ -896,16 +1072,17 @@ func (c *Config) SaveNodes() error {
 		}
 		switch node.Source {
 		case NodeSourceInline:
-			inlineNodes = append(inlineNodes, cleanNode)
-		case NodeSourceFile, NodeSourceSubscription:
-			fileNodes = append(fileNodes, cleanNode)
+			inlineNodes = append(inlineNodes, clean)
+		case NodeSourceFile:
+			fileNodes = append(fileNodes, clean)
+		case NodeSourceSubscription:
+			subNodes = append(subNodes, clean)
 		default:
-			// Default to file nodes for unknown source
-			fileNodes = append(fileNodes, cleanNode)
+			fileNodes = append(fileNodes, clean)
 		}
 	}
 
-	// Write file-based nodes to nodes.txt
+	// Write manual nodes_file
 	if len(fileNodes) > 0 || c.NodesFile != "" {
 		nodesFilePath := c.NodesFile
 		if nodesFilePath == "" {
@@ -916,21 +1093,31 @@ func (c *Config) SaveNodes() error {
 		}
 	}
 
-	// Only update config.yaml if there are inline nodes to save
-	// and preserve the original config structure
-	if len(inlineNodes) > 0 {
-		// Read original config to preserve structure
-		data, err := os.ReadFile(c.filePath)
-		if err != nil {
-			return fmt.Errorf("read config: %w", err)
+	// Write subscription cache file (only when there are subscription nodes)
+	if len(subNodes) > 0 {
+		subPath := c.subscriptionCacheFilePath()
+		if subPath != "" {
+			if err := writeNodesToFile(subPath, subNodes); err != nil {
+				return fmt.Errorf("write subscription cache %q: %w", subPath, err)
+			}
 		}
-		var saveCfg Config
-		if err := yaml.Unmarshal(data, &saveCfg); err != nil {
-			return fmt.Errorf("decode config: %w", err)
-		}
-		// Update only the inline nodes
-		saveCfg.Nodes = inlineNodes
+	}
 
+	// Update config.yaml nodes field if needed:
+	// - there are inline nodes, OR
+	// - on-disk config currently has inline nodes (e.g. user deleted all via WebUI)
+	data, err := os.ReadFile(c.filePath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	var saveCfg Config
+	if err := yaml.Unmarshal(data, &saveCfg); err != nil {
+		return fmt.Errorf("decode config: %w", err)
+	}
+
+	shouldWriteNodes := len(inlineNodes) > 0 || len(saveCfg.Nodes) > 0
+	if shouldWriteNodes {
+		saveCfg.Nodes = inlineNodes
 		newData, err := yaml.Marshal(&saveCfg)
 		if err != nil {
 			return fmt.Errorf("encode config: %w", err)
@@ -944,13 +1131,11 @@ func (c *Config) SaveNodes() error {
 }
 
 // Save is deprecated, use SaveNodes instead.
-// This method is kept for backward compatibility but now delegates to SaveNodes.
 func (c *Config) Save() error {
 	return c.SaveNodes()
 }
 
-// SaveSettings persists only config settings (external_ip, probe_target, skip_cert_verify)
-// without touching nodes.txt. Use this for settings API updates.
+// SaveSettings persists only config settings (external_ip, probe_target, skip_cert_verify).
 func (c *Config) SaveSettings() error {
 	if c == nil {
 		return errors.New("config is nil")
@@ -991,4 +1176,21 @@ func isPortAvailable(address string, port uint16) bool {
 	}
 	_ = ln.Close()
 	return true
+}
+
+func dedupeNodesKeepFirst(nodes []NodeConfig) []NodeConfig {
+	seen := make(map[string]struct{}, len(nodes))
+	out := make([]NodeConfig, 0, len(nodes))
+	for _, n := range nodes {
+		key := strings.TrimSpace(n.URI)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, n)
+	}
+	return out
 }

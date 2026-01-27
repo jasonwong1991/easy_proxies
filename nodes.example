@@ -1,25 +1,46 @@
-# Easy Proxies 节点文件示例
-# 每行一个代理节点 URI，名称会自动从 #后面提取
-# 以 # 开头的行是注释，空行会被忽略
+# Easy Proxies 节点文件示例（建议每行写完整 URI）
+# 每行一个节点 URI；名称可用 #后缀（支持 URL 编码）。
+# 以 # 开头的是注释，空行会被忽略。
 
-# VLESS 协议示例
-vless://c5f7fbb5-2018-4295-8ff9-340d720c63c9@hinet-tw-01-ddns.sakuraikaede.com:30001?encryption=none&flow=xtls-rprx-vision&security=reality&sni=swcdn.apple.com&fp=chrome&pbk=N4ID6C12xSHKASsdAa5tff7br6Ns8ehIRYDzhjZL_ns&sid=267D949F&type=tcp&headerType=none&host=swcdn.apple.com#TW-VLESS节点
+# ====== 上游 HTTP/HTTPS 代理节点（可直接当作节点加入池） ======
 
-# Hysteria2 协议示例
-hysteria2://c5f7fbb5-2018-4295-8ff9-340d720c63c9@hinet-tw-01-ddns.sakuraikaede.com:30002?sni=hinet.eessgrgrgrgr.cloudns.nz&insecure=0#TW-Hysteria2节点
+# HTTP 代理（明文）
+http://203.0.113.10:8080#示例HTTP代理
 
-# Shadowsocks 协议示例
-ss://MjAyMi1ibGFrZTMtYWVzLTEyOC1nY206TWpBMFl6Z3daakJsTTJaa05tUmxOQT09OlpETmpNR1E0WkRjdE5qUmpOeTAwT0E9PQ@hkaws.go52pokemon.com:54259#🇹🇼台湾家宽节点
+# HTTPS 代理（HTTP proxy over TLS）
+https://203.0.113.11:443?sni=www.bing.com&allowInsecure=1#示例HTTPS代理
 
-# Trojan 协议示例
-trojan://d3c0d8d7-64c7-489c-8adb-e955615e7baa@sskr01.go52pokemon.com:59110?allowInsecure=1&peer=www.volcengine.com&sni=www.volcengine.com&type=tcp#🇰🇷韩国家宽节点
+# HTTP 代理但需要 TLS（部分列表只给 host:443；可用 query 强制 tls=1）
+http://203.0.113.12:443?tls=1&sni=www.bing.com&allowInsecure=1#示例HTTP_TLS代理
 
-# 支持中文和 emoji 名称
-vless://77606596-b3b7-522d-92e4-4ac5218d3bff@mirror3.fastcfbest.autos:1802?encryption=none&security=tls&sni=oauth2.linuxmail.link&alpn=h2,http/1.1&fp=safari&type=ws&host=oauth2.linuxmail.link&path=/v1#美国原生家宽
+# ====== 上游 SOCKS 代理节点 ======
 
-# 可以直接复制粘贴机场订阅中的节点链接
-# ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@example.com:8388#测试节点1
-# ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@example.com:8388#测试节点2
+# SOCKS5 代理
+socks5://198.51.100.10:1080#示例SOCKS5代理
 
-# 文件可以包含任意数量的节点
-# 所有节点会自动分配端口（从 multi_port.base_port 开始递增）
+# SOCKS5 代理（带认证）
+socks5://user:pass@198.51.100.11:1080#示例SOCKS5认证
+
+# 带额外描述的列表行（只会读取第一段 URL，其余会忽略）
+socks5://198.51.100.12:1080 [[机房] 示例描述会被忽略]
+
+# ====== 常见代理协议节点（示例占位） ======
+
+# VLESS（Reality / TLS / WS / gRPC 等参数可直接从订阅复制）
+vless://00000000-0000-0000-0000-000000000000@example.com:443?encryption=none&security=reality&sni=example.com&fp=chrome&pbk=REPLACE_ME&sid=REPLACE_ME&type=tcp&flow=xtls-rprx-vision#示例VLESS
+
+# VMess（Base64 JSON 形式，占位）
+vmess://REPLACE_WITH_BASE64_JSON#示例VMess
+
+# Trojan
+trojan://password@example.com:443?sni=example.com&allowInsecure=1#示例Trojan
+
+# Shadowsocks（userinfo 为 base64(method:password)，占位）
+ss://REPLACE_WITH_BASE64_METHOD_PASSWORD@example.com:8388#示例SS
+
+# Hysteria2
+hysteria2://password@example.com:443?sni=example.com&insecure=0#示例Hysteria2
+
+# ====== 提示 ======
+# 1) 如果你拿到的是纯 host:port 列表，建议用 subscriptions 并在 URL 后加 #http/#https/#socks5 来指定协议。
+# 2) 公共 HTTP/SOCKS 列表通常不稳定，建议配合 pool.failure_threshold: 1 与较短 blacklist_duration（如 10m）。
