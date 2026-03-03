@@ -578,11 +578,25 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleExport 导出所有可用代理池节点的 HTTP 代理 URI，每行一个
-// 在 hybrid 模式下，只导出 multi-port 格式（每节点独立端口）
+// handleExport 导出所有可用代理池节点的代理 URI，每行一个。
+// query 参数:
+//   - scheme=http   (默认)
+//   - scheme=socks5
+//   - scheme=all    (同时导出 HTTP 和 SOCKS5)
+// 在 hybrid 模式下，只导出 multi-port 格式（每节点独立端口）。
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	scheme := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("scheme")))
+	if scheme == "" {
+		scheme = "http"
+	}
+	if scheme != "http" && scheme != "socks5" && scheme != "all" {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": "invalid scheme, use http/socks5/all"})
 		return
 	}
 
@@ -605,20 +619,32 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		var proxyURI string
+		var authPart string
 		if s.cfg.ProxyUsername != "" && s.cfg.ProxyPassword != "" {
-			proxyURI = fmt.Sprintf("http://%s:%s@%s:%d",
-				s.cfg.ProxyUsername, s.cfg.ProxyPassword,
-				listenAddr, snap.Port)
-		} else {
-			proxyURI = fmt.Sprintf("http://%s:%d", listenAddr, snap.Port)
+			authPart = fmt.Sprintf("%s:%s@", s.cfg.ProxyUsername, s.cfg.ProxyPassword)
 		}
-		lines = append(lines, proxyURI)
+		httpURI := fmt.Sprintf("http://%s%s:%d", authPart, listenAddr, snap.Port)
+		socksURI := fmt.Sprintf("socks5://%s%s:%d", authPart, listenAddr, snap.Port)
+
+		switch scheme {
+		case "http":
+			lines = append(lines, httpURI)
+		case "socks5":
+			lines = append(lines, socksURI)
+		case "all":
+			lines = append(lines, httpURI, socksURI)
+		}
 	}
 
 	// 返回纯文本，每行一个 URI
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Content-Disposition", "attachment; filename=proxy_pool.txt")
+	filename := "proxy_pool.txt"
+	if scheme == "socks5" {
+		filename = "proxy_pool_socks5.txt"
+	} else if scheme == "all" {
+		filename = "proxy_pool_all.txt"
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
 	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
 }
 

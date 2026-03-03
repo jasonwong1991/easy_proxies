@@ -47,7 +47,7 @@ type GeoIPConfig struct {
 	AutoUpdateInterval time.Duration `yaml:"auto_update_interval"` // 自动更新间隔，默认 24 小时
 }
 
-// ListenerConfig defines how the HTTP proxy should listen for clients.
+// ListenerConfig defines how the HTTP/SOCKS5 mixed proxy should listen for clients.
 type ListenerConfig struct {
 	Address  string `yaml:"address"`
 	Port     uint16 `yaml:"port"`

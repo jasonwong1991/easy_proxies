@@ -4,7 +4,7 @@
 
 Easy Proxies is a sing-box based proxy pool manager.
 
-It focuses on turning many upstream nodes into one stable local HTTP proxy entry, while still supporting per-node ports when needed.
+It focuses on turning many upstream nodes into one stable local HTTP/SOCKS5 proxy entry, while still supporting per-node ports when needed.
 
 ## What It Does
 
@@ -106,8 +106,8 @@ If you see logs like `lookup <domain>: empty result`, set a reachable resolver a
 
 ## Runtime Modes
 
-- `pool`: one HTTP entry for all nodes.
-- `multi-port`: one local HTTP port per node.
+- `pool`: one HTTP/SOCKS5 entry for all nodes.
+- `multi-port`: one local HTTP/SOCKS5 port per node.
 - `hybrid`: pool + multi-port together.
 
 ## Node Source Behavior

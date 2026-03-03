@@ -4,7 +4,7 @@
 
 Easy Proxies 是一个基于 sing-box 的代理池管理工具。
 
-目标是把大量上游节点统一成稳定的本地 HTTP 代理入口，同时支持按节点独立端口访问。
+目标是把大量上游节点统一成稳定的本地 HTTP/SOCKS5 代理入口，同时支持按节点独立端口访问。
 
 ## 当前能力
 
@@ -106,8 +106,8 @@ dns:
 
 ## 运行模式
 
-- `pool`：所有节点共享一个本地 HTTP 入口。
-- `multi-port`：每个节点一个独立本地端口。
+- `pool`：所有节点共享一个本地 HTTP/SOCKS5 入口。
+- `multi-port`：每个节点一个独立本地 HTTP/SOCKS5 端口。
 - `hybrid`：同时启用 pool + multi-port。
 
 ## 节点来源行为
