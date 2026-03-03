@@ -1,0 +1,19 @@
+mode: pool
+log_level: info
+skip_cert_verify: true
+listener:
+  address: 127.0.0.1
+  port: 29999
+  username: ""
+  password: ""
+pool:
+  mode: sequential
+  failure_threshold: 3
+  blacklist_duration: 24h
+management:
+  enabled: false
+  listen: 127.0.0.1:39091
+  probe_target: www.apple.com:80
+nodes:
+  - name: test-node
+    uri: socks5://127.0.0.1:65535#test
