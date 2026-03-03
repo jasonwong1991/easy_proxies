@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -1021,18 +1020,6 @@ func IsPortAvailable(address string, port uint16) bool {
 	}
 	_ = ln.Close()
 	return true
-}
-
-// File locking helpers
-
-// lockFile acquires an exclusive lock on the file.
-func lockFile(f *os.File) error {
-	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
-}
-
-// unlockFile releases the lock on the file.
-func unlockFile(f *os.File) error {
-	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
 
 // writeFileWithLock writes data to a file with exclusive locking.
