@@ -1121,14 +1121,14 @@ func normalizeHysteria2PortHoppingURI(rawURI string) (string, bool) {
 		return "", false
 	}
 	userInfo := rest[:atIdx]
-	hostPort := rest[atIdx+1:]
+	authority := rest[atIdx+1:]
 
-	portSep := strings.LastIndex(hostPort, ":")
+	portSep := strings.LastIndex(authority, ":")
 	if portSep == -1 {
 		return "", false
 	}
-	host := hostPort[:portSep]
-	rawPort := strings.TrimSpace(hostPort[portSep+1:])
+	host := authority[:portSep]
+	rawPort := strings.TrimSpace(authority[portSep+1:])
 	if host == "" || rawPort == "" {
 		return "", false
 	}
