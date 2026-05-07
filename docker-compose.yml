@@ -5,6 +5,7 @@ services:
     restart: unless-stopped
     # 方式一：使用主机网络模式（推荐，支持端口自动重分配）
     network_mode: host
+    user: "${UID:-10001}:${GID:-10001}"
     # 方式二：手动映射端口（注释掉 network_mode，启用下面的 ports）
     # ports:
     #   # Pool 模式入口（pool/hybrid 模式使用）
@@ -24,15 +25,20 @@ services:
     #   - 独立节点入口：http://0.0.0.0:24000, ... 或 socks5://0.0.0.0:24000, ...（直连特定节点）
     #   - 节点状态在两种入口间共享（黑名单同步）
     #   - 端口冲突时自动重分配到下一个可用端口
-    # ⚠️ 重要：config.yaml 和 nodes.txt 必须在启动容器前创建为文件！
-    # 如果这些文件不存在，Docker 会将它们创建为目录，导致程序异常。
-    # 首次使用请先执行：
-    #   cp config.example.yaml config.yaml && touch nodes.txt
-    # 或直接使用 start.sh 启动（会自动处理）
+    #
+    # 使用示例：
+    #
+    #   方式一：映射配置目录（推荐，零配置启动）
+    #     docker run --user $(id -u):$(id -g) -v ./data:/etc/easy_proxies ghcr.io/jasonwong1991/easy_proxies:latest
+    #
+    #   方式二：映射配置文件（传统方式）
+    #     docker run -v ./config.yaml:/etc/easy_proxies/config.yaml -v ./nodes.txt:/etc/easy_proxies/nodes.txt ghcr.io/jasonwong1991/easy_proxies:latest
+    #
     volumes:
-      # 配置文件需要可写权限以支持 WebUI 设置保存
-      # 如遇权限问题，请在宿主机执行: chmod 666 config.yaml nodes.txt
-      - ./config.yaml:/etc/easy_proxies/config.yaml
-      - ./nodes.txt:/etc/easy_proxies/nodes.txt
+      # 方式一：映射配置目录（首次启动自动生成 config.yaml 和 nodes.txt）
+      - ./data:/etc/easy_proxies
+      # 方式二：映射配置文件（需要预先创建）
+      # - ./config.yaml:/etc/easy_proxies/config.yaml
+      # - ./nodes.txt:/etc/easy_proxies/nodes.txt
       # 日志映射目录（当从 WebUI 开启日志写到文件时有效）
       - ./logs:/app/logs

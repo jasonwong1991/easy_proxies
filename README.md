@@ -33,6 +33,18 @@ Edit `config.yaml` and add your proxy nodes (inline nodes, `nodes.txt` file, or 
 
 ### 2. Run with Docker (Recommended)
 
+Zero-config: config files are auto-generated on first run.
+
+```bash
+mkdir -p data logs
+docker run --user $(id -u):$(id -g) \
+  -v $(pwd)/data:/etc/easy_proxies \
+  -v $(pwd)/logs:/app/logs \
+  --network host \
+  ghcr.io/jasonwong1991/easy_proxies:latest
+```
+
+Or use docker compose:
 ```bash
 ./start.sh
 # or manually:
@@ -314,7 +326,7 @@ When `management.password` is empty, authentication is bypassed.
 
 ### docker-compose.yml
 
-The default setup uses host networking (recommended for automatic port management). Volumes mount `config.yaml` and `nodes.txt`:
+The default setup uses host networking (recommended for automatic port management). Config directory is auto-generated on first run:
 
 ```yaml
 services:
@@ -323,16 +335,16 @@ services:
     container_name: easy_proxies
     restart: unless-stopped
     network_mode: host
+    user: "${UID:-10001}:${GID:-10001}"
     volumes:
-      - ./config.yaml:/etc/easy_proxies/config.yaml
-      - ./nodes.txt:/etc/easy_proxies/nodes.txt
+      - ./data:/etc/easy_proxies
       - ./logs:/app/logs
 ```
 
 ### Important Notes
 
-- **Create config files first**: `config.yaml` and `nodes.txt` must exist as files before running `docker compose up`. Use `./start.sh` which handles this automatically.
-- **Permissions**: Files need write permission for WebUI settings to persist (`chmod 666 config.yaml nodes.txt`).
+- **Zero-config**: When mapping a directory, `config.yaml` and `nodes.txt` are auto-generated on first run.
+- **Permissions**: Use `--user $(id -u):$(id -g)` to match your host user for file access.
 - **Multi-platform**: Supports amd64 and arm64 architectures.
 - **Reload**: `/api/reload` and subscription refresh will interrupt active connections.
 
