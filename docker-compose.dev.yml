@@ -13,7 +13,7 @@ services:
       - "2323:2323"       # Pool 入口
       - "9091:9091"       # WebUI
       - "24000-24100:24000-24100"  # Multi-port
+    user: "${UID:-10001}:${GID:-10001}"
     volumes:
-      - ./config.yaml:/etc/easy_proxies/config.yaml
-      - ./nodes.txt:/etc/easy_proxies/nodes.txt
+      - ./data:/etc/easy_proxies
       - ./logs:/app/logs

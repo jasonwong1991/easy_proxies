@@ -1,67 +1,28 @@
 #!/bin/sh
-# Fix bind-mount directory issue and ownership, then start easy_proxies
+# Auto-generate config and fix permissions, then start easy_proxies
 
-OVERRIDE_CONFIG=false
-CONFIG_PATH="/etc/easy_proxies/config.yaml"
+CONFIG_DIR="/etc/easy_proxies"
+CONFIG_FILE="$CONFIG_DIR/config.yaml"
+NODES_FILE="$CONFIG_DIR/nodes.txt"
+EXAMPLE_CONFIG="/app/config.example.yaml"
 
-# Check if config.yaml was bind-mounted as a directory (Docker creates directories
-# for non-existent bind-mount sources)
-if [ -d "/etc/easy_proxies/config.yaml" ]; then
-  echo "=======================================================" >&2
-  echo "WARNING: config.yaml is a directory, not a file!" >&2
-  echo "This happens when Docker creates the bind-mount target" >&2
-  echo "before the file exists on the host." >&2
-  echo "" >&2
-  echo "To fix permanently, run on the host:" >&2
-  echo "  docker compose down && rm -rf config.yaml && touch config.yaml && docker compose up -d" >&2
-  echo "Or use start.sh which handles this automatically." >&2
-  echo "=======================================================" >&2
+# Get current user uid/gid for permission fix
+CURRENT_UID=$(id -u 2>/dev/null || echo "10001")
+CURRENT_GID=$(id -g 2>/dev/null || echo "10001")
 
-  CONFIG_PATH="/tmp/default_config.yaml"
-  cat > "$CONFIG_PATH" <<'YAML'
-mode: pool
-
-listener:
-  address: 0.0.0.0
-  port: 2323
-
-pool:
-  mode: balance
-
-management:
-  enabled: true
-  listen: 0.0.0.0:9091
-  password: ""
-
-dns:
-  server: 223.5.5.5
-  port: 53
-  strategy: prefer_ipv4
-YAML
-  OVERRIDE_CONFIG=true
-  echo "INFO: Using fallback config at $CONFIG_PATH" >&2
+# Auto-generate config.yaml if not exists
+if [ ! -f "$CONFIG_FILE" ]; then
+    cp "$EXAMPLE_CONFIG" "$CONFIG_FILE"
+    echo "[easy_proxies] Generated default config from $EXAMPLE_CONFIG"
 fi
 
-# Check if nodes.txt was bind-mounted as a directory
-if [ -d "/etc/easy_proxies/nodes.txt" ]; then
-  echo "=======================================================" >&2
-  echo "WARNING: nodes.txt is a directory, not a file!" >&2
-  echo "This happens when Docker creates the bind-mount target" >&2
-  echo "before the file exists on the host." >&2
-  echo "" >&2
-  echo "To fix permanently, run on the host:" >&2
-  echo "  docker compose down && rm -rf nodes.txt && touch nodes.txt && docker compose up -d" >&2
-  echo "Or use start.sh which handles this automatically." >&2
-  echo "=======================================================" >&2
+# Auto-create nodes.txt if not exists
+if [ ! -f "$NODES_FILE" ]; then
+    touch "$NODES_FILE"
+    echo "[easy_proxies] Created empty nodes.txt"
 fi
 
-# Fix ownership of mounted config directory so the non-root user can write
-chown -R easy:easy /etc/easy_proxies 2>/dev/null || true
-chown -R easy:easy /app 2>/dev/null || true
+# Fix ownership of mounted files so the current user can access them
+chown -R "$CURRENT_UID:$CURRENT_GID" /etc/easy_proxies 2>/dev/null || true
 
-if [ "$OVERRIDE_CONFIG" = "true" ]; then
-  chown easy:easy "$CONFIG_PATH" 2>/dev/null || true
-  exec gosu easy /usr/local/bin/easy_proxies --config "$CONFIG_PATH"
-else
-  exec gosu easy /usr/local/bin/easy_proxies "$@"
-fi
+exec /usr/local/bin/easy_proxies "$@"
