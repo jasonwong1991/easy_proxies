@@ -27,7 +27,8 @@ import (
 // Build converts high level config into sing-box Options tree.
 func Build(cfg *config.Config) (option.Options, error) {
 	baseOutbounds := make([]option.Outbound, 0, len(cfg.Nodes))
-	memberTags := make([]string, 0, len(cfg.Nodes))
+	allMemberTags := make([]string, 0, len(cfg.Nodes))
+	poolMemberTags := make([]string, 0, len(cfg.Nodes))
 	metadata := make(map[string]poolout.MemberMeta)
 	var failedNodes []string
 	usedTags := make(map[string]int) // Track tag usage for uniqueness
@@ -66,7 +67,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 		}
 		baseTag := sanitizeTag(node.Name)
 		if baseTag == "" {
-			baseTag = fmt.Sprintf("node-%d", len(memberTags)+1)
+			baseTag = fmt.Sprintf("node-%d", len(allMemberTags)+1)
 		}
 
 		// Ensure tag uniqueness by appending a counter if needed
@@ -84,12 +85,17 @@ func Build(cfg *config.Config) (option.Options, error) {
 			failedNodes = append(failedNodes, node.Name)
 			continue
 		}
-		memberTags = append(memberTags, tag)
+		poolEnabled := cfg.NodePoolEnabled(node, tag)
+		allMemberTags = append(allMemberTags, tag)
+		if poolEnabled {
+			poolMemberTags = append(poolMemberTags, tag)
+		}
 		baseOutbounds = append(baseOutbounds, outbound)
 		meta := poolout.MemberMeta{
-			Name: node.Name,
-			URI:  node.URI,
-			Mode: cfg.Mode,
+			Name:        node.Name,
+			URI:         node.URI,
+			Mode:        cfg.Mode,
+			PoolEnabled: poolEnabled,
 		}
 		// For multi-port and hybrid modes, use per-node port
 		if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
@@ -110,7 +116,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 	// Concurrent GeoIP resolution
 	if geoLookup != nil && geoLookup.IsEnabled() {
 		geoStart := time.Now()
-		log.Printf("🌍 Resolving GeoIP for %d nodes (concurrent)...", len(memberTags))
+		log.Printf("🌍 Resolving GeoIP for %d nodes (concurrent)...", len(allMemberTags))
 
 		type geoResult struct {
 			index  int
@@ -118,13 +124,13 @@ func Build(cfg *config.Config) (option.Options, error) {
 			region geoip.RegionInfo
 		}
 
-		results := make(chan geoResult, len(memberTags))
+		results := make(chan geoResult, len(allMemberTags))
 		var wg sync.WaitGroup
 
-		// Worker pool: min(32, len(memberTags))
+		// Worker pool: min(32, len(allMemberTags))
 		workerCount := 32
-		if len(memberTags) < workerCount {
-			workerCount = len(memberTags)
+		if len(allMemberTags) < workerCount {
+			workerCount = len(allMemberTags)
 		}
 
 		// Job channel
@@ -133,7 +139,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 			tag   string
 			uri   string
 		}
-		jobs := make(chan geoJob, len(memberTags))
+		jobs := make(chan geoJob, len(allMemberTags))
 
 		// Start workers
 		for w := 0; w < workerCount; w++ {
@@ -148,7 +154,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 		}
 
 		// Send jobs
-		for i, tag := range memberTags {
+		for i, tag := range allMemberTags {
 			meta := metadata[tag]
 			jobs <- geoJob{index: i, tag: tag, uri: meta.URI}
 		}
@@ -166,13 +172,15 @@ func Build(cfg *config.Config) (option.Options, error) {
 			meta.Region = res.region.Code
 			meta.Country = res.region.Country
 			metadata[res.tag] = meta
-			regionMembers[res.region.Code] = append(regionMembers[res.region.Code], res.tag)
+			if meta.PoolEnabled {
+				regionMembers[res.region.Code] = append(regionMembers[res.region.Code], res.tag)
+			}
 		}
 
 		log.Printf("🌍 GeoIP resolution completed in %.1fs", time.Since(geoStart).Seconds())
 	} else {
 		// No GeoIP - assign all to "other" region
-		for _, tag := range memberTags {
+		for _, tag := range poolMemberTags {
 			regionMembers[geoip.RegionOther] = append(regionMembers[geoip.RegionOther], tag)
 		}
 	}
@@ -221,6 +229,9 @@ func Build(cfg *config.Config) (option.Options, error) {
 	if !enablePoolInbound && !enableMultiPort {
 		return option.Options{}, fmt.Errorf("unsupported mode %s", cfg.Mode)
 	}
+	if enablePoolInbound && len(poolMemberTags) == 0 {
+		return option.Options{}, fmt.Errorf("no pool-enabled nodes available (all %d valid nodes are excluded from the shared pool)", len(baseOutbounds))
+	}
 
 	// Build pool inbound (single entry point for all nodes)
 	if enablePoolInbound {
@@ -231,7 +242,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 		inbounds = append(inbounds, inbound)
 		poolOptions := poolout.Options{
 			Mode:              cfg.Pool.Mode,
-			Members:           memberTags,
+			Members:           poolMemberTags,
 			FailureThreshold:  cfg.Pool.FailureThreshold,
 			BlacklistDuration: cfg.Pool.BlacklistDuration,
 			RetryEnabled:      cfg.Pool.RetryEnabledOrDefault(),
@@ -257,7 +268,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 			inbounds = append(inbounds, stickyInbound)
 			stickyOptions := poolout.Options{
 				Mode:              cfg.Pool.Mode,
-				Members:           memberTags,
+				Members:           poolMemberTags,
 				FailureThreshold:  cfg.Pool.FailureThreshold,
 				BlacklistDuration: cfg.Pool.BlacklistDuration,
 				RetryEnabled:      cfg.Pool.RetryEnabledOrDefault(),
@@ -293,7 +304,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 		if err != nil {
 			return option.Options{}, fmt.Errorf("parse multi-port address: %w", err)
 		}
-		for _, tag := range memberTags {
+		for _, tag := range allMemberTags {
 			meta := metadata[tag]
 			perMeta := map[string]poolout.MemberMeta{tag: meta}
 			poolTag := fmt.Sprintf("%s-%s", poolout.Tag, tag)
