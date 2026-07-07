@@ -9,6 +9,7 @@ easy_proxies-*
 config.yaml
 nodes.txt
 node_ports.json
+node_prefs.json
 
 # GeoIP database (auto-downloaded)
 *.mmdb
