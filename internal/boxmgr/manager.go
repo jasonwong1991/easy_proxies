@@ -490,7 +490,7 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 				if poolOpts, ok := ob.Options.(*pool.Options); ok {
 					poolOpts.Members = removeFromSlice(poolOpts.Members, badTag)
 					delete(poolOpts.Metadata, badTag)
-					
+
 					// If the pool is now empty, remove it to avoid another validation error
 					if len(poolOpts.Members) == 0 {
 						log.Printf("⚠️  Removing empty pool '%s'", ob.Tag)
@@ -867,6 +867,9 @@ func (m *Manager) ReloadWithPortMap(newCfg *config.Config, portMap map[string]ui
 	if err := newCfg.SaveNodePortMap(); err != nil {
 		m.logger.Warnf("failed to persist node ports: %v", err)
 	}
+	if err := newCfg.SaveNodePrefs(); err != nil {
+		m.logger.Warnf("failed to persist node prefs: %v", err)
+	}
 	return nil
 }
 
@@ -901,7 +904,6 @@ func extractPortFromBindError(err error) uint16 {
 	}
 	return 0
 }
-
 
 // reassignConflictingPort finds the node using the conflicting port and assigns a new port.
 func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {
