@@ -1,6 +1,9 @@
 package subscription
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"easy_proxies/internal/config"
@@ -125,5 +128,39 @@ func TestCreateNewConfig_SubscriptionSourceMarked(t *testing.T) {
 	// Verify source is set to subscription
 	if newCfg.Nodes[0].Source != config.NodeSourceSubscription {
 		t.Errorf("expected source to be subscription, got %s", newCfg.Nodes[0].Source)
+	}
+}
+
+func TestCreateNewConfig_AppliesPersistedSubscriptionPoolPrefs(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("mode: hybrid\nnodes: []\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	oldURI := "vless://uuid-a@example.com:443?type=ws&security=tls#Old"
+	newURI := "vless://uuid-a@example.com:443?security=tls&type=ws#New"
+	poolEnabled := false
+	prefs := map[string]config.NodePrefs{
+		(&config.NodeConfig{URI: oldURI}).NodeKey(): {PoolEnabled: &poolEnabled},
+	}
+	data, err := json.Marshal(prefs)
+	if err != nil {
+		t.Fatalf("encode prefs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "node_prefs.json"), data, 0o644); err != nil {
+		t.Fatalf("write prefs: %v", err)
+	}
+
+	baseCfg := &config.Config{Mode: "hybrid"}
+	baseCfg.SetFilePath(cfgPath)
+	mgr := &Manager{baseCfg: baseCfg}
+
+	newCfg := mgr.createNewConfig([]config.NodeConfig{{Name: "New", URI: newURI}})
+	if len(newCfg.Nodes) != 1 {
+		t.Fatalf("nodes = %d, want 1", len(newCfg.Nodes))
+	}
+	if newCfg.Nodes[0].PoolEnabled == nil || *newCfg.Nodes[0].PoolEnabled {
+		t.Fatalf("PoolEnabled = %v, want false", newCfg.Nodes[0].PoolEnabled)
 	}
 }
