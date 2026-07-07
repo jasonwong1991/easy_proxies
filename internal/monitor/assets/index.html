@@ -548,6 +548,7 @@
                   <th>地域</th>
                   <th>名称 (Name/Tag)</th>
                   <th>端口</th>
+                  <th>代理池</th>
                   <th>延迟 / 质量</th>
                   <th>连接</th>
                   <th>失败</th>
@@ -584,7 +585,7 @@
         <div class="panel">
           <div class="table-container">
             <table>
-              <thead><tr><th>名称</th><th>URI</th><th>端口</th><th>来源</th><th>操作</th></tr></thead>
+              <thead><tr><th>名称</th><th>URI</th><th>端口</th><th>代理池</th><th>来源</th><th>操作</th></tr></thead>
               <tbody id="configNodesTableBody"></tbody>
             </table>
           </div>
@@ -720,6 +721,10 @@
                 </div>
                 <div class="form-group"><label>故障阈值</label><input type="number" id="settingPoolFailure" class="setting-input" min="1" max="100" placeholder="3" /></div>
                 <div class="form-group"><label>黑名单时长</label><input type="text" id="settingPoolBlacklist" class="setting-input" placeholder="24h" /></div>
+                <div class="form-group" style="grid-column: 1 / -1;">
+                  <label>排除关键词（每行一个，匹配节点名称、Tag 或 URI）</label>
+                  <textarea id="settingPoolExcludeKeywords" class="setting-input" rows="3" placeholder="Premium&#10;高倍率&#10;倍率:5"></textarea>
+                </div>
               </div>
             </div>
 
@@ -861,6 +866,14 @@
           <div class="form-group">
             <label>映射端口 (可选)</label>
             <input type="number" id="nodePort" placeholder="0" />
+          </div>
+          <div class="form-group">
+            <label>代理池策略</label>
+            <select id="nodePoolEnabled" class="setting-input">
+              <option value="">默认（跟随关键词规则）</option>
+              <option value="true">加入代理池</option>
+              <option value="false">仅独立端口</option>
+            </select>
           </div>
           <input type="hidden" id="nodeEditName" />
         </div>
@@ -1253,6 +1266,7 @@
             <div class="cell-trunc" style="font-size: 11px; color: var(--text-muted)" title="${escapeHtml(n.tag)}">${escapeHtml(n.tag)}</div>
           </td>
           <td class="tt-mono">${n.port || '-'}</td>
+          <td><span class="badge ${n.pool_enabled ? 'badge-healthy' : 'badge-warning'}">${n.pool_enabled ? '入池' : '独立'}</span></td>
           <td>
             <div style="display:flex; align-items:center;">
               <span class="tt-mono" style="width:40px">${ms>=0 ? ms+'ms' : '-'}</span>
@@ -1400,6 +1414,7 @@
             <td><strong class="cell-trunc" style="display:inline-block;vertical-align:bottom" title="${escapeHtml(n.name)}">${escapeHtml(n.name)}</strong></td>
             <td class="tt-mono cell-trunc cell-trunc-uri" title="${escapeHtml(n.uri)}">${escapeHtml(n.uri)}</td>
             <td class="tt-mono">${n.port || '-'}</td>
+            <td><span class="badge ${nodePoolBadge(n).cls}">${nodePoolBadge(n).text}</span></td>
             <td><span class="badge ${n.source==='subscription'?'badge-warning':'badge-healthy'}">${n.source||'manual'}</span></td>
             <td>
               <button class="btn btn-sm" onclick="showEditNodeModal('${escapeAttrJs(n.name)}')">编辑</button>
@@ -1411,16 +1426,28 @@
       } catch(e){}
     }
 
-    function showAddNodeModal() { isEditMode=false; document.getElementById('nodeModalTitle').textContent='添加节点'; document.getElementById('nodeName').value=''; document.getElementById('nodeUri').value=''; document.getElementById('nodePort').value=''; document.getElementById('nodeModalOverlay').classList.add('show');}
+    function nodePoolBadge(n) {
+      if (n.pool_enabled === true) return { cls: 'badge-healthy', text: '入池' };
+      if (n.pool_enabled === false) return { cls: 'badge-warning', text: '独立' };
+      return { cls: 'badge-offline', text: '默认' };
+    }
+    function showAddNodeModal() { isEditMode=false; document.getElementById('nodeModalTitle').textContent='添加节点'; document.getElementById('nodeName').value=''; document.getElementById('nodeUri').value=''; document.getElementById('nodePort').value=''; document.getElementById('nodePoolEnabled').value=''; document.getElementById('nodeModalOverlay').classList.add('show');}
     function showEditNodeModal(name) { 
       const n = configNodes.find(x=>x.name===name); if(!n) return;
       isEditMode=true; document.getElementById('nodeModalTitle').textContent='编辑节点';
       document.getElementById('nodeName').value=n.name; document.getElementById('nodeUri').value=n.uri; document.getElementById('nodePort').value=n.port||''; document.getElementById('nodeEditName').value=n.name;
+      document.getElementById('nodePoolEnabled').value = n.pool_enabled === true ? 'true' : (n.pool_enabled === false ? 'false' : '');
       document.getElementById('nodeModalOverlay').classList.add('show');
     }
     async function handleNodeSubmit(e) {
       e.preventDefault();
-      const p = { name: document.getElementById('nodeName').value, uri: document.getElementById('nodeUri').value, port: parseInt(document.getElementById('nodePort').value)||0 };
+      const p = {
+        name: document.getElementById('nodeName').value,
+        uri: document.getElementById('nodeUri').value,
+        port: parseInt(document.getElementById('nodePort').value)||0
+      };
+      const poolValue = document.getElementById('nodePoolEnabled').value;
+      if (poolValue !== '') p.pool_enabled = poolValue === 'true';
       try {
         const editName = document.getElementById('nodeEditName').value;
         const url = isEditMode ? '/api/nodes/config/'+encodeURIComponent(editName) : '/api/nodes/config';
@@ -1554,6 +1581,7 @@
         document.getElementById('settingPoolMode').value = pl.mode || 'random';
         document.getElementById('settingPoolFailure').value = pl.failure_threshold || 3;
         document.getElementById('settingPoolBlacklist').value = pl.blacklist_duration || '24h';
+        document.getElementById('settingPoolExcludeKeywords').value = (pl.exclude_keywords || []).join('\n');
         // Sticky
         const st = d.sticky || {};
         document.getElementById('settingStickyEnabled').checked = !!st.enabled;
@@ -1612,6 +1640,7 @@
         pool_mode: document.getElementById('settingPoolMode').value,
         pool_failure: document.getElementById('settingPoolFailure').value,
         pool_blacklist: document.getElementById('settingPoolBlacklist').value,
+        pool_exclude_keywords: document.getElementById('settingPoolExcludeKeywords').value,
         sticky_enabled: document.getElementById('settingStickyEnabled').checked,
         sticky_port: document.getElementById('settingStickyPort').value,
         mgmt_listen: document.getElementById('settingMgmtListen').value,
@@ -1678,6 +1707,7 @@
             mode: document.getElementById('settingPoolMode').value,
             failure_threshold: parseInt(document.getElementById('settingPoolFailure').value) || 3,
             blacklist_duration: document.getElementById('settingPoolBlacklist').value || '24h',
+            exclude_keywords: document.getElementById('settingPoolExcludeKeywords').value.split('\n').map(s => s.trim()).filter(s => s),
           },
           sticky: {
             enabled: document.getElementById('settingStickyEnabled').checked,
