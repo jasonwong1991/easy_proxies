@@ -926,6 +926,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				"mode":               cfg.Pool.Mode,
 				"failure_threshold":  cfg.Pool.FailureThreshold,
 				"blacklist_duration": cfg.Pool.BlacklistDuration.String(),
+				"exclude_keywords":   cfg.Pool.ExcludeKeywords,
 			}
 			resp["sticky"] = map[string]any{
 				"enabled": cfg.Sticky.Enabled,
@@ -965,9 +966,10 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				Password string `json:"password"`
 			} `json:"multi_port,omitempty"`
 			Pool *struct {
-				Mode              string `json:"mode"`
-				FailureThreshold  int    `json:"failure_threshold"`
-				BlacklistDuration string `json:"blacklist_duration"`
+				Mode              string   `json:"mode"`
+				FailureThreshold  int      `json:"failure_threshold"`
+				BlacklistDuration string   `json:"blacklist_duration"`
+				ExcludeKeywords   []string `json:"exclude_keywords"`
 			} `json:"pool,omitempty"`
 			Sticky *struct {
 				Enabled bool   `json:"enabled"`
@@ -1041,6 +1043,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			if req.Pool != nil {
 				s.cfgSrc.Pool.Mode = req.Pool.Mode
 				s.cfgSrc.Pool.FailureThreshold = req.Pool.FailureThreshold
+				s.cfgSrc.Pool.ExcludeKeywords = cleanKeywords(req.Pool.ExcludeKeywords)
 				if req.Pool.BlacklistDuration != "" {
 					if d, err := time.ParseDuration(req.Pool.BlacklistDuration); err == nil {
 						s.cfgSrc.Pool.BlacklistDuration = d
@@ -1083,6 +1086,20 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func cleanKeywords(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	cleaned := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			cleaned = append(cleaned, value)
+		}
+	}
+	return cleaned
 }
 
 // handleSubscriptionStatus returns the current subscription refresh status.
@@ -1233,20 +1250,22 @@ func (s *Server) handleSubscriptionConfig(w http.ResponseWriter, r *http.Request
 
 // nodePayload is the JSON request body for node CRUD operations.
 type nodePayload struct {
-	Name     string `json:"name"`
-	URI      string `json:"uri"`
-	Port     uint16 `json:"port"`
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Name        string `json:"name"`
+	URI         string `json:"uri"`
+	Port        uint16 `json:"port"`
+	Username    string `json:"username"`
+	Password    string `json:"password"`
+	PoolEnabled *bool  `json:"pool_enabled"`
 }
 
 func (p nodePayload) toConfig() config.NodeConfig {
 	return config.NodeConfig{
-		Name:     p.Name,
-		URI:      p.URI,
-		Port:     p.Port,
-		Username: p.Username,
-		Password: p.Password,
+		Name:        p.Name,
+		URI:         p.URI,
+		Port:        p.Port,
+		Username:    p.Username,
+		Password:    p.Password,
+		PoolEnabled: p.PoolEnabled,
 	}
 }
 

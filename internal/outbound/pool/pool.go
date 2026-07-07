@@ -61,6 +61,7 @@ type MemberMeta struct {
 	Mode          string
 	ListenAddress string
 	Port          uint16
+	PoolEnabled   bool
 	Region        string // GeoIP region code: "jp", "kr", "us", "hk", "tw", "other"
 	Country       string // Full country name from GeoIP
 }
@@ -142,6 +143,7 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 				Mode:          meta.Mode,
 				ListenAddress: meta.ListenAddress,
 				Port:          meta.Port,
+				PoolEnabled:   meta.PoolEnabled,
 				Region:        meta.Region,
 				Country:       meta.Country,
 			}
@@ -247,6 +249,7 @@ func (p *poolOutbound) initializeMembersLocked() error {
 				Mode:          meta.Mode,
 				ListenAddress: meta.ListenAddress,
 				Port:          meta.Port,
+				PoolEnabled:   meta.PoolEnabled,
 				Region:        meta.Region,
 				Country:       meta.Country,
 			}

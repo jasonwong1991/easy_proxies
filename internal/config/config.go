@@ -82,6 +82,7 @@ type PoolConfig struct {
 	Mode              string        `yaml:"mode"`
 	FailureThreshold  int           `yaml:"failure_threshold"`
 	BlacklistDuration time.Duration `yaml:"blacklist_duration"`
+	ExcludeKeywords   []string      `yaml:"exclude_keywords,omitempty"`
 	// RetryEnabled toggles automatic fail-over to another member when a dial fails.
 	// nil/unset → default true. Use *bool so users can explicitly disable via YAML.
 	RetryEnabled *bool `yaml:"retry_enabled,omitempty"`
@@ -138,12 +139,13 @@ const (
 
 // NodeConfig describes a single upstream proxy endpoint expressed as URI.
 type NodeConfig struct {
-	Name     string     `yaml:"name" json:"name"`
-	URI      string     `yaml:"uri" json:"uri"`
-	Port     uint16     `yaml:"port,omitempty" json:"port,omitempty"`
-	Username string     `yaml:"username,omitempty" json:"username,omitempty"`
-	Password string     `yaml:"password,omitempty" json:"password,omitempty"`
-	Source   NodeSource `yaml:"-" json:"source,omitempty"` // Runtime only, not persisted
+	Name        string     `yaml:"name" json:"name"`
+	URI         string     `yaml:"uri" json:"uri"`
+	Port        uint16     `yaml:"port,omitempty" json:"port,omitempty"`
+	Username    string     `yaml:"username,omitempty" json:"username,omitempty"`
+	Password    string     `yaml:"password,omitempty" json:"password,omitempty"`
+	PoolEnabled *bool      `yaml:"pool_enabled,omitempty" json:"pool_enabled,omitempty"`
+	Source      NodeSource `yaml:"-" json:"source,omitempty"` // Runtime only, not persisted
 }
 
 // NodeKey returns a stable identifier for the node, used to preserve port
@@ -156,6 +158,25 @@ type NodeConfig struct {
 // keeps the same key — and therefore the same proxy port.
 func (n *NodeConfig) NodeKey() string {
 	return stableNodeKey(n.URI)
+}
+
+// NodePoolEnabled reports whether a node should participate in shared pool
+// entries. Per-node configuration wins over keyword matching.
+func (c *Config) NodePoolEnabled(node NodeConfig, tag string) bool {
+	if node.PoolEnabled != nil {
+		return *node.PoolEnabled
+	}
+	if c == nil || len(c.Pool.ExcludeKeywords) == 0 {
+		return true
+	}
+	haystack := strings.ToLower(node.Name + "\n" + tag + "\n" + node.URI)
+	for _, keyword := range c.Pool.ExcludeKeywords {
+		keyword = strings.ToLower(strings.TrimSpace(keyword))
+		if keyword != "" && strings.Contains(haystack, keyword) {
+			return false
+		}
+	}
+	return true
 }
 
 // stableNodeKey derives a port-stable identity from a proxy URI by stripping the
@@ -214,6 +235,8 @@ func Load(path string) (*Config, error) {
 	if err := cfg.normalize(); err != nil {
 		return nil, err
 	}
+
+	cfg.ApplyNodePrefs()
 
 	// Restore persisted proxy ports so a restart keeps the same port per node.
 	if err := cfg.applyPersistedPorts(); err != nil {
@@ -389,6 +412,9 @@ func (c *Config) normalize() error {
 			cachedNodes, err := loadNodesFromFile(c.NodesFile)
 			if err == nil && len(cachedNodes) > 0 {
 				log.Printf("⚠️  All subscriptions failed, using %d cached nodes from %s", len(cachedNodes), c.NodesFile)
+				for idx := range cachedNodes {
+					cachedNodes[idx].Source = NodeSourceSubscription
+				}
 				c.Nodes = append(c.Nodes, cachedNodes...)
 			}
 		}
@@ -492,6 +518,12 @@ func (c *Config) BuildPortMap() map[string]uint16 {
 // survive a process restart.
 const nodePortMapFile = "node_ports.json"
 
+const nodePrefsFile = "node_prefs.json"
+
+type NodePrefs struct {
+	PoolEnabled *bool `json:"pool_enabled,omitempty"`
+}
+
 // portMapPath returns the path of the port-map sidecar, located next to the
 // main config file. It is empty when the config path is unknown.
 func (c *Config) portMapPath() string {
@@ -499,6 +531,13 @@ func (c *Config) portMapPath() string {
 		return ""
 	}
 	return filepath.Join(filepath.Dir(c.filePath), nodePortMapFile)
+}
+
+func (c *Config) nodePrefsPath() string {
+	if c.filePath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(c.filePath), nodePrefsFile)
 }
 
 // loadNodePortMap reads a previously saved stableNodeKey→port mapping. It
@@ -517,6 +556,79 @@ func loadNodePortMap(path string) map[string]uint16 {
 		return nil
 	}
 	return m
+}
+
+func loadNodePrefs(path string) map[string]NodePrefs {
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var m map[string]NodePrefs
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil
+	}
+	return m
+}
+
+// ApplyNodePrefs restores persisted per-node preferences for file/subscription
+// nodes. Inline nodes keep their explicit config.yaml values.
+func (c *Config) ApplyNodePrefs() {
+	if c == nil {
+		return
+	}
+	prefs := loadNodePrefs(c.nodePrefsPath())
+	if len(prefs) == 0 {
+		return
+	}
+	for i := range c.Nodes {
+		switch c.Nodes[i].Source {
+		case NodeSourceFile, NodeSourceSubscription:
+		default:
+			continue
+		}
+		pref, ok := prefs[c.Nodes[i].NodeKey()]
+		if !ok || pref.PoolEnabled == nil {
+			continue
+		}
+		c.Nodes[i].PoolEnabled = pref.PoolEnabled
+	}
+}
+
+func (c *Config) BuildNodePrefs() map[string]NodePrefs {
+	prefs := make(map[string]NodePrefs)
+	for _, node := range c.Nodes {
+		switch node.Source {
+		case NodeSourceFile, NodeSourceSubscription:
+		default:
+			continue
+		}
+		if node.PoolEnabled == nil {
+			continue
+		}
+		prefs[node.NodeKey()] = NodePrefs{PoolEnabled: node.PoolEnabled}
+	}
+	return prefs
+}
+
+func (c *Config) SaveNodePrefs() error {
+	if c == nil {
+		return errors.New("config is nil")
+	}
+	path := c.nodePrefsPath()
+	if path == "" {
+		return errors.New("config file path is unknown")
+	}
+	data, err := json.MarshalIndent(c.BuildNodePrefs(), "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode node prefs: %w", err)
+	}
+	if err := writeFileWithLock(path, data, 0o644); err != nil {
+		return fmt.Errorf("write node prefs %q: %w", path, err)
+	}
+	return nil
 }
 
 // bridgeLegacyPortKeys upgrades a port-map sidecar written by an older version
@@ -1498,11 +1610,12 @@ func (c *Config) SaveNodes() error {
 	for _, node := range c.Nodes {
 		// Create a clean copy without runtime fields for saving
 		cleanNode := NodeConfig{
-			Name:     node.Name,
-			URI:      node.URI,
-			Port:     node.Port,
-			Username: node.Username,
-			Password: node.Password,
+			Name:        node.Name,
+			URI:         node.URI,
+			Port:        node.Port,
+			Username:    node.Username,
+			Password:    node.Password,
+			PoolEnabled: node.PoolEnabled,
 		}
 		switch node.Source {
 		case NodeSourceInline:
@@ -1513,6 +1626,10 @@ func (c *Config) SaveNodes() error {
 			// Default to file nodes for unknown source
 			fileNodes = append(fileNodes, cleanNode)
 		}
+	}
+
+	if err := c.SaveNodePrefs(); err != nil {
+		return fmt.Errorf("save node prefs: %w", err)
 	}
 
 	// Write file-based nodes to nodes.txt

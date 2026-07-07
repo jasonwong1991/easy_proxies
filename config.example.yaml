@@ -62,6 +62,14 @@ pool:
   retry_enabled: true
   # 重试次数（包含首次拨号），默认 3
   retry_attempts: 3
+  # 排除关键词：未显式设置 pool_enabled 的节点，如果名称、Tag 或 URI 包含这些文本，
+  # 将不加入 pool/sticky/GeoIP 代理池，但在 hybrid/multi-port 下仍保留独立端口。
+  # 常用于订阅里的高倍率、Premium、特殊地区节点。
+  # 对订阅/nodes_file 节点在 WebUI 中设置的显式入池偏好会保存到 node_prefs.json，
+  # 订阅刷新或节点改名后仍会按稳定节点标识恢复。
+  exclude_keywords:
+    # - Premium
+    # - 高倍率
 
 # ───────────────────────────────────────────────────────────────
 # 粘性代理配置（可选，仅 pool / hybrid 模式生效）
@@ -156,6 +164,7 @@ nodes:
   # - name: "自定义名称"
   #   uri: "ss://base64@server:8388"
   #   port: 24001              # 手动指定端口（multi-port/hybrid 模式）
+  #   pool_enabled: false      # false = 只保留独立端口，不加入代理池
   #   username: "custom_user"  # 覆盖默认认证（可选）
   #   password: "custom_pass"
 

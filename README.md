@@ -98,6 +98,9 @@ pool:
   blacklist_duration: 24h
   retry_enabled: true # retry on another node when a dial fails
   retry_attempts: 3   # max total dial attempts per request
+  exclude_keywords:   # optional: keep matching nodes out of the shared pool
+    - Premium
+    - high-rate
 
 management:
   enabled: true
@@ -313,6 +316,21 @@ Supports Base64, plain text, and Clash YAML formats. When subscriptions are conf
 
 **Stable Ports** (`multi-port`/`hybrid`): each node is identified by a stable key derived from its URI (ignoring the display name and parameter order), so a node keeps the same local port even when the subscription renames or reorders it. Assignments are saved to `node_ports.json` next to `config.yaml` and restored on restart.
 
+**Pool membership** (`hybrid`): nodes can keep their dedicated multi-port entry while staying out of the shared pool. For inline/manual nodes, set `pool_enabled: false`. For subscription or `nodes_file` nodes, WebUI changes are persisted in `node_prefs.json` next to `config.yaml`, keyed by the same stable node identity used for port preservation, so the preference survives subscription refreshes and renames. Use `pool.exclude_keywords` for bulk matching by node name, tag, or URI. An explicit node-level `pool_enabled: true` overrides keyword exclusion.
+
+```yaml
+pool:
+  exclude_keywords:
+    - Premium
+    - high-rate
+
+nodes:
+  - name: "Premium-HK-01"
+    uri: "vless://uuid@server:443?security=tls#Premium-HK-01"
+    port: 24001
+    pool_enabled: false
+```
+
 ## WebUI Dashboard
 
 Access at `http://your-server:9091` (configurable via the `management` section).
@@ -381,7 +399,7 @@ services:
 | 1221 | GeoIP region router (when enabled, configurable) |
 | 24000+ | Multi-port mode (one per node) |
 
-In `multi-port`/`hybrid` mode, per-node ports are persisted to `node_ports.json` (next to `config.yaml`) and restored on restart, so each node keeps a stable port across restarts and subscription refreshes. Delete this file to force a clean reassignment.
+In `multi-port`/`hybrid` mode, per-node ports are persisted to `node_ports.json` (next to `config.yaml`) and restored on restart, so each node keeps a stable port across restarts and subscription refreshes. Pool membership preferences for subscription/file nodes are persisted to `node_prefs.json` in the same directory. Delete these files to force a clean reassignment/default pool-membership state.
 
 ## Troubleshooting
 

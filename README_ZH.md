@@ -73,6 +73,9 @@ pool:
   blacklist_duration: 24h
   retry_enabled: true # 拨号失败时切换到另一节点重试
   retry_attempts: 3   # 每个请求的最大拨号次数
+  exclude_keywords:   # 可选：命中的节点不加入共享代理池
+    - Premium
+    - high-rate
 
 management:
   enabled: true
@@ -141,6 +144,20 @@ dns:
   - 节点顺序：内联节点在前，订阅节点在后
   - 各节点的来源标识（inline/subscription）会在管理界面中显示
 - **端口稳定**（multi-port/hybrid）：节点按 URI 稳定标识（忽略名称与参数顺序），订阅改名或重排都保持同一本地端口；分配结果保存到 config.yaml 同目录的 `node_ports.json`，重启后自动恢复。删除该文件可强制重新分配。
+- **代理池成员控制**（hybrid）：节点可以保留独立端口但不加入共享代理池。内联/手动节点可设置 `pool_enabled: false`；订阅和 `nodes_file` 节点仍保持一行一个 URI，WebUI 修改会按稳定节点标识保存到 `node_prefs.json`，订阅刷新或改名后仍会恢复。也可用 `pool.exclude_keywords` 按名称、Tag 或 URI 批量排除。节点级 `pool_enabled: true` 会覆盖关键词排除。
+
+```yaml
+pool:
+  exclude_keywords:
+    - Premium
+    - high-rate
+
+nodes:
+  - name: "Premium-HK-01"
+    uri: "vless://uuid@server:443?security=tls#Premium-HK-01"
+    port: 24001
+    pool_enabled: false
+```
 
 ## 协议支持注意事项
 

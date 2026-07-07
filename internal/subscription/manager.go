@@ -597,6 +597,7 @@ func (m *Manager) createNewConfig(nodes []config.NodeConfig) *config.Config {
 	}
 
 	newCfg.Nodes = mergedNodes
+	newCfg.ApplyNodePrefs()
 	return &newCfg
 }
 

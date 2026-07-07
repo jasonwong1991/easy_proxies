@@ -2,6 +2,7 @@ package boxmgr
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,5 +61,95 @@ nodes: []
 	}
 	if !strings.Contains(string(data), "a.example.com") {
 		t.Errorf("config.yaml should contain the inline node URI, got:\n%s", data)
+	}
+}
+
+func TestCreateNode_PreservesPoolEnabled(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("mode: hybrid\nnodes: []\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg := &config.Config{
+		Mode:  "hybrid",
+		Nodes: []config.NodeConfig{},
+	}
+	cfg.SetFilePath(cfgPath)
+
+	m := New(cfg, monitor.Config{})
+	poolEnabled := false
+	created, err := m.CreateNode(context.Background(), config.NodeConfig{
+		Name:        "Premium",
+		URI:         "socks5://127.0.0.1:1080#Premium",
+		PoolEnabled: &poolEnabled,
+	})
+	if err != nil {
+		t.Fatalf("CreateNode: %v", err)
+	}
+	if created.PoolEnabled == nil || *created.PoolEnabled {
+		t.Fatalf("created PoolEnabled = %v, want false", created.PoolEnabled)
+	}
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config back: %v", err)
+	}
+	if !strings.Contains(string(data), "pool_enabled: false") {
+		t.Errorf("config.yaml should contain pool_enabled: false, got:\n%s", data)
+	}
+}
+
+func TestUpdateSubscriptionNode_PersistsPoolEnabledToSidecar(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	nodesPath := filepath.Join(dir, "nodes.txt")
+	if err := os.WriteFile(cfgPath, []byte("mode: hybrid\nnodes_file: nodes.txt\nnodes: []\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	uri := "socks5://127.0.0.1:1080#Premium"
+	cfg := &config.Config{
+		Mode:      "hybrid",
+		NodesFile: nodesPath,
+		Nodes: []config.NodeConfig{
+			{Name: "Premium", URI: uri, Source: config.NodeSourceSubscription},
+		},
+	}
+	cfg.SetFilePath(cfgPath)
+
+	m := New(cfg, monitor.Config{})
+	poolEnabled := false
+	updated, err := m.UpdateNode(context.Background(), "Premium", config.NodeConfig{
+		Name:        "Premium",
+		URI:         uri,
+		PoolEnabled: &poolEnabled,
+	})
+	if err != nil {
+		t.Fatalf("UpdateNode: %v", err)
+	}
+	if updated.Source != config.NodeSourceSubscription {
+		t.Fatalf("source = %q, want subscription", updated.Source)
+	}
+
+	nodesData, err := os.ReadFile(nodesPath)
+	if err != nil {
+		t.Fatalf("read nodes: %v", err)
+	}
+	if got := string(nodesData); got != uri+"\n" {
+		t.Fatalf("nodes.txt = %q, want URI only", got)
+	}
+
+	prefsData, err := os.ReadFile(filepath.Join(dir, "node_prefs.json"))
+	if err != nil {
+		t.Fatalf("read prefs: %v", err)
+	}
+	var prefs map[string]config.NodePrefs
+	if err := json.Unmarshal(prefsData, &prefs); err != nil {
+		t.Fatalf("decode prefs: %v", err)
+	}
+	pref := prefs[(&config.NodeConfig{URI: uri}).NodeKey()]
+	if pref.PoolEnabled == nil || *pref.PoolEnabled {
+		t.Fatalf("pool preference = %#v, want false", pref.PoolEnabled)
 	}
 }
