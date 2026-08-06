@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const regionHeader = "X-Easyproxy-Region"
+
 // RouterConfig holds configuration for the GeoIP router
 type RouterConfig struct {
 	Listen   string
@@ -136,8 +138,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// Extract region from path
-	region, targetHost := r.parseRequest(req)
+	// Extract the requested region after proxy authentication succeeds.
+	region, targetHost, err := r.parseRequest(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	// Get the appropriate pool
 	r.mu.RLock()
@@ -163,40 +169,57 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 // parseRequest extracts region and target host from the request
-func (r *Router) parseRequest(req *http.Request) (region, targetHost string) {
-	// For CONNECT requests, the host is in req.Host
-	// For regular requests, check the path prefix
+func (r *Router) parseRequest(req *http.Request) (region, targetHost string, err error) {
+	// A proxy-specific header works for both regular HTTP requests and CONNECT
+	// tunnels. Remove it before forwarding a regular HTTP request upstream.
+	headerRegion := strings.TrimSpace(req.Header.Get(regionHeader))
+	req.Header.Del(regionHeader)
+	if headerRegion != "" {
+		region = strings.ToLower(headerRegion)
+		for _, reg := range AllRegions() {
+			if region == reg {
+				return region, req.Host, nil
+			}
+		}
+		return "", "", fmt.Errorf("unsupported GeoIP region %q", headerRegion)
+	}
 
+	// Retain the existing path and CONNECT authority forms as fallbacks.
 	if req.Method == http.MethodConnect {
 		// CONNECT requests: check if host starts with region prefix
 		// e.g., CONNECT jp/example.com:443 or just example.com:443
 		host := req.Host
+		// net/http parses jp/example.com:443 as URL.Host=jp and
+		// URL.Path=/example.com:443. Rebuild the original authority.
+		if req.URL != nil && req.URL.Host != "" && req.URL.Path != "" {
+			host = req.URL.Host + req.URL.Path
+		}
 		for _, reg := range AllRegions() {
 			prefix := reg + "/"
 			if strings.HasPrefix(host, prefix) {
-				return reg, strings.TrimPrefix(host, prefix)
+				return reg, strings.TrimPrefix(host, prefix), nil
 			}
 		}
-		return "", host
+		return "", host, nil
 	}
 
-	// For regular HTTP requests, check URL path
+	// For regular HTTP requests, check URL path.
 	path := req.URL.Path
 	for _, reg := range AllRegions() {
 		prefix := "/" + reg + "/"
 		if strings.HasPrefix(path, prefix) {
 			// Rewrite the path
 			req.URL.Path = "/" + strings.TrimPrefix(path, prefix)
-			return reg, req.Host
+			return reg, req.Host, nil
 		}
 		// Also check for exact match like /jp
 		if path == "/"+reg {
 			req.URL.Path = "/"
-			return reg, req.Host
+			return reg, req.Host, nil
 		}
 	}
 
-	return "", req.Host
+	return "", req.Host, nil
 }
 
 // handleConnect handles HTTPS CONNECT tunneling
