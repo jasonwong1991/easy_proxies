@@ -167,95 +167,43 @@ Key behaviors:
 
 ### How to Use
 
-The GeoIP router is an HTTP proxy that listens on its own port. You select a region by adding a path prefix to your request.
-
-#### HTTP Requests
-
-Format: `http://<geoip_host>:<geoip_port>/<region>/`
-
-```bash
-# Route through Japanese nodes
-curl -x http://user:pass@localhost:1221/jp/ http://example.com
-
-# Route through US nodes
-curl -x http://user:pass@localhost:1221/us/ http://example.com
-
-# Route through Hong Kong nodes
-curl -x http://user:pass@localhost:1221/hk/ http://example.com
-
-# Route through Singapore nodes
-curl -x http://user:pass@localhost:1221/sg/ http://example.com
-
-# No region prefix = use global pool (all nodes)
-curl -x http://user:pass@localhost:1221/ http://example.com
-```
-
-#### HTTPS Requests (CONNECT Tunnel)
-
-For HTTPS, the region prefix goes before the target host in the CONNECT request:
+The GeoIP router is an HTTP proxy that listens on its own port. Select a
+region with the `X-Easyproxy-Region` proxy request header. This works for
+both regular HTTP requests and HTTPS CONNECT tunnels without changing the
+target URL.
 
 ```bash
-# Route HTTPS through Japanese nodes
-https_proxy=http://user:pass@localhost:1221/jp/ curl https://www.google.com
+# Route through Japanese nodes.
+curl --proxy http://user:pass@localhost:1221 \
+  --proxy-header 'X-Easyproxy-Region: jp' \
+  https://www.google.com
 
-# Route HTTPS through US nodes
-https_proxy=http://user:pass@localhost:1221/us/ curl https://www.google.com
+# Route through US nodes.
+curl --proxy http://user:pass@localhost:1221 \
+  --proxy-header 'X-Easyproxy-Region: us' \
+  http://example.com
 
-# No region prefix = use global pool
-https_proxy=http://user:pass@localhost:1221/ curl https://www.google.com
+# No header uses the global pool.
+curl --proxy http://user:pass@localhost:1221 https://www.google.com
 ```
 
-#### Using with Applications
+Supported values are `jp`, `kr`, `us`, `hk`, `tw`, `sg`, and `other`.
+Unsupported values return `400 Bad Request`. The header is removed before a
+regular HTTP request is forwarded to the target server.
 
-**Environment variables:**
+#### Legacy Path Fallback
 
-```bash
-# Use Japanese nodes for all traffic
-export http_proxy=http://user:pass@your-server:1221/jp/
-export https_proxy=http://user:pass@your-server:1221/jp/
-
-# Use global pool (all nodes)
-export http_proxy=http://user:pass@your-server:1221/
-export https_proxy=http://user:pass@your-server:1221/
-```
-
-**Browser proxy extensions (SwitchyOmega, FoxyProxy, etc.):**
-
-- Protocol: HTTP
-- Server: your-server-ip
-- Port: 1221
-- Username/Password: as configured in `listener`
-- For region-specific routing: set the proxy URL path to include the region prefix (e.g., `/jp/`)
-
-**Python requests:**
-
-```python
-import requests
-
-proxies = {
-    "http": "http://user:pass@your-server:1221/jp/",
-    "https": "http://user:pass@your-server:1221/jp/",
-}
-r = requests.get("http://example.com", proxies=proxies)
-```
-
-**Go net/http:**
-
-```go
-proxyURL, _ := url.Parse("http://user:pass@your-server:1221/jp/")
-client := &http.Client{
-    Transport: &http.Transport{
-        Proxy: http.ProxyURL(proxyURL),
-    },
-}
-resp, err := client.Get("http://example.com")
-```
+Path-based region selection remains available for clients that actually send
+the path in the proxy request, including `CONNECT jp/example.com:443`.
+Standard HTTP proxy clients do not transmit a path included in the proxy URL,
+so a proxy URL such as `http://localhost:1221/jp/` cannot select a region.
+Use a proxy-specific header facility instead.
 
 ### How It Works
 
 1. On startup, each node's server IP is resolved and looked up in the MaxMind GeoLite2-Country database
 2. Nodes are grouped into per-region pools (`pool-jp`, `pool-kr`, `pool-us`, etc.) with independent health checking
-3. The GeoIP router listens on its own port and inspects the request path for a region prefix
+3. The GeoIP router listens on its own port and selects a region from a proxy request header
 4. Matching requests are routed through the corresponding region pool; unmatched requests use the global pool
 5. Each region pool uses the same scheduling algorithm configured in the `pool` section
 6. DNS lookup results are cached to avoid repeated resolution on reload

@@ -88,6 +88,74 @@ dns:
 nodes_file: nodes.txt
 ```
 
+## GeoIP 地区路由
+
+启用 GeoIP 后，Easy Proxies 会按节点的地理位置自动分类，并提供独立
+HTTP 代理入口，以便通过指定地区的节点转发流量。
+
+### 支持的地区
+
+| 代码 | 地区 |
+| --- | --- |
+| `jp` | 日本 |
+| `kr` | 韩国 |
+| `us` | 美国 |
+| `hk` | 香港 |
+| `tw` | 台湾 |
+| `sg` | 新加坡 |
+| `other` | 其他地区 |
+
+### 配置
+
+```yaml
+geoip:
+  enabled: true
+  database_path: "./GeoLite2-Country.mmdb"
+  listen: "0.0.0.0"          # 省略时使用 listener.address
+  port: 1221                  # 省略时使用 listener.port
+  auto_update_enabled: true   # 自动更新 GeoIP 数据库
+  auto_update_interval: 24h   # 检查间隔
+```
+
+GeoIP 路由器复用 `listener.username` 和 `listener.password` 进行代理认证。
+
+- 首次启动时会自动下载 MaxMind GeoLite2-Country 数据库。
+- 默认每 24 小时检查更新，并热重载数据库，无需重启。
+- 启动和每次重载时都会自动重新分类节点。
+- 无法解析或查询 IP 归属地的节点会进入 `other` 分类。
+
+### 使用方法
+
+GeoIP 路由器是独立端口上的 HTTP 代理。使用代理专用请求头
+`X-Easyproxy-Region` 选择地区；普通 HTTP 请求和 HTTPS `CONNECT`
+隧道都支持，且无需修改目标 URL。
+
+```bash
+# 通过日本节点访问 HTTPS 目标。
+curl --proxy http://user:pass@localhost:1221 \
+  --proxy-header 'X-Easyproxy-Region: jp' \
+  https://www.google.com
+
+# 通过美国节点访问 HTTP 目标。
+curl --proxy http://user:pass@localhost:1221 \
+  --proxy-header 'X-Easyproxy-Region: us' \
+  http://example.com
+
+# 不设置请求头时使用全局节点池。
+curl --proxy http://user:pass@localhost:1221 https://www.google.com
+```
+
+支持的值为 `jp`、`kr`、`us`、`hk`、`tw`、`sg` 和 `other`。不支持的值会
+返回 `400 Bad Request`。转发普通 HTTP 请求前会删除该内部请求头，不会将它
+发送给目标服务器。
+
+#### 旧路径格式兼容
+
+仍保留实际代理请求中携带路径时的地区选择，以及
+`CONNECT jp/example.com:443` 的旧格式兼容。标准 HTTP 代理客户端通常不会
+把代理地址中的路径发送给代理服务，因此 `http://localhost:1221/jp/`
+不能可靠地选择地区，应改用代理专用请求头功能。
+
 ## 粘性代理（可选，仅 Pool/Hybrid 模式）
 
 开启后会额外监听一个独立端口（默认 `listener.port + 1`，即 `2324`），与原 `2323` 端口共存。通过粘性端口接入的客户端会按**来源 IP** 固定绑定到同一个上游节点，保持出口 IP 稳定（避免轮询导致 IP 频繁跳变触发风控/掉登录态）。绑定为永久保持，仅当该节点被拉黑/移除时才重新选择。监听地址与认证复用 `listener` 配置。
