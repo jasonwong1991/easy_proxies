@@ -294,7 +294,7 @@ go test ./...
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=jasonwong1991/easy_proxies&type=Date)](https://star-history.com/#jasonwong1991/easy_proxies&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=jasonwong1991/easy_proxies&type=Date)](https://star-history.dera.page/#jasonwong1991/easy_proxies&Date)
 
 ## 致谢
 
