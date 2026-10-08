@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.2] - 2026-10-08
+
 ### Fixed
 - Preserve `grpc-opts.grpc-service-name` when converting Clash VMess and Trojan nodes to URIs, so their gRPC transports use the configured service name instead of an empty one (#37).
 
